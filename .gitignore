@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local OS/editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Credentials and wallet material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.seed
+*.mnemonic
+secrets/
+private/
+
+# Local project data and generated artifacts
+work/
+data/
+reports/
+logs/
+cache/
+vendor/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.parquet
+*.jsonl
+*.jsonl.gz
+
+# Internal agent coordination documents
+DailyWeather_PRIVATE_MIGRATION_BRIEF.md
+*PRIVATE*.md
+*private*.md
+*brief*.md
+memory*.md
+.codex/
+.agents/
+

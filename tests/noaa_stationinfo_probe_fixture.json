@@ -1,0 +1,33 @@
+{
+  "schema_version": "dailyweather.noaa_stationinfo_probe.v1",
+  "purpose": "frozen_primary_source_station_coordinates_not_a_model_result",
+  "observed_at_utc": "2026-08-17T10:17:14Z",
+  "request_url": "https://aviationweather.gov/api/data/stationinfo?ids=KAUS,ZBAA,KORD,KDAL,KBKF,ZGGG,KHOU,EGLC,KLAX,LEMD,KMIA,UUWW,KLGA,LFPB,KSFO,KSEA,RKSI,ZSPD,ZGSZ,WSSS,RCSS,RJTT&format=json",
+  "http_status": 200,
+  "response_etag": "W/\"11de-ipLAiHbqOyqNtqLvpi0U5W2bqlE\"",
+  "raw_response_sha256": "ac9fb2c3524e89a32b290453db2b42e5c78d69d6831a4388357f3dcd5ad81381",
+  "response_body": [
+    {"id":"EGLC","icaoId":"EGLC","iataId":"LCY","faaId":null,"wmoId":null,"site":"London City Arpt","lat":51.505,"lon":0.055,"elev":10,"state":"EN","country":"GB","priority":6,"siteType":["METAR","TAF"]},
+    {"id":"KAUS","icaoId":"KAUS","iataId":"AUS","faaId":"AUS","wmoId":"72254","site":"Austin/Bergstrom Intl","lat":30.1831,"lon":-97.68063,"elev":148,"state":"TX","country":"US","priority":3,"siteType":["METAR","TAF"]},
+    {"id":"KBKF","icaoId":"KBKF","iataId":"BFK","faaId":"BKF","wmoId":null,"site":"Buckley SFB","lat":39.713,"lon":-104.758,"elev":1703,"state":"CO","country":"US","priority":6,"siteType":["METAR","TAF"]},
+    {"id":"KDAL","icaoId":"KDAL","iataId":"DAL","faaId":"DAL","wmoId":"72258","site":"Dallas/Love Fld","lat":32.83836,"lon":-96.83584,"elev":148,"state":"TX","country":"US","priority":6,"siteType":["METAR","TAF"]},
+    {"id":"KHOU","icaoId":"KHOU","iataId":"HOU","faaId":"HOU","wmoId":"72244","site":"Houston/Hobby Arpt","lat":29.64582,"lon":-95.28214,"elev":13,"state":"TX","country":"US","priority":5,"siteType":["METAR","TAF"]},
+    {"id":"KLAX","icaoId":"KLAX","iataId":"LAX","faaId":"LAX","wmoId":"72295","site":"Los Angeles Intl","lat":33.93817,"lon":-118.3866,"elev":30,"state":"CA","country":"US","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"KLGA","icaoId":"KLGA","iataId":"LGA","faaId":"LGA","wmoId":"72503","site":"New York/La Guardia Arpt","lat":40.77945,"lon":-73.88027,"elev":9,"state":"NY","country":"US","priority":6,"siteType":["METAR","TAF"]},
+    {"id":"KMIA","icaoId":"KMIA","iataId":"MIA","faaId":"MIA","wmoId":"72202","site":"Miami Intl","lat":25.78806,"lon":-80.31692,"elev":1,"state":"FL","country":"US","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"KORD","icaoId":"KORD","iataId":"ORD","faaId":"ORD","wmoId":"72530","site":"Chicago/O'Hare Intl","lat":41.96017,"lon":-87.93161,"elev":202,"state":"IL","country":"US","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"KSEA","icaoId":"KSEA","iataId":"SEA","faaId":"SEA","wmoId":"72793","site":"Seattle-Tacoma Intl","lat":47.44467,"lon":-122.31442,"elev":115,"state":"WA","country":"US","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"KSFO","icaoId":"KSFO","iataId":"SFO","faaId":"SFO","wmoId":"72494","site":"San Francisco Intl","lat":37.61961,"lon":-122.36561,"elev":2,"state":"CA","country":"US","priority":1,"siteType":["METAR","TAF"]},
+    {"id":"LEMD","icaoId":"LEMD","iataId":"MAD","faaId":null,"wmoId":"08221","site":"Madrid/Barajas Arpt","lat":40.466,"lon":-3.555,"elev":589,"state":"M","country":"ES","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"LFPB","icaoId":"LFPB","iataId":"LBG","faaId":null,"wmoId":"07150","site":"Paris/Le Bourge Arpt","lat":48.967,"lon":2.428,"elev":50,"state":"ID","country":"FR","priority":6,"siteType":["METAR","TAF"]},
+    {"id":"RCSS","icaoId":"RCSS","iataId":"TSA","faaId":null,"wmoId":"46696","site":"Taipei/Songshan Arpt","lat":25.069,"lon":121.552,"elev":8,"state":"TP","country":"TW","priority":5,"siteType":["METAR","TAF"]},
+    {"id":"RJTT","icaoId":"RJTT","iataId":"HND","faaId":null,"wmoId":"47671","site":"Tokyo/Haneda Intl","lat":35.553,"lon":139.781,"elev":5,"state":"13","country":"JP","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"RKSI","icaoId":"RKSI","iataId":"ICN","faaId":null,"wmoId":null,"site":"Seoul/Incheon Intl","lat":37.469,"lon":126.451,"elev":7,"state":"28","country":"KR","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"UUWW","icaoId":"UUWW","iataId":"VKO","faaId":null,"wmoId":null,"site":"Moscow/Vnukovo Arpt","lat":55.592,"lon":37.261,"elev":195,"state":"MO","country":"RU","priority":5,"siteType":["METAR","TAF"]},
+    {"id":"WSSS","icaoId":"WSSS","iataId":"SIN","faaId":null,"wmoId":"48698","site":"Singapore/Changi Intl","lat":1.368,"lon":103.982,"elev":17,"state":"4","country":"SG","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"ZBAA","icaoId":"ZBAA","iataId":"PEK","faaId":null,"wmoId":"54511","site":"Beijing Intl","lat":40.082,"lon":116.603,"elev":31,"state":"BJ","country":"CN","priority":0,"siteType":["METAR","TAF"]},
+    {"id":"ZGGG","icaoId":"ZGGG","iataId":"CAN","faaId":null,"wmoId":"59287","site":"Guangzhou/Baiyun Intl","lat":23.392,"lon":113.307,"elev":11,"state":"GD","country":"CN","priority":3,"siteType":["METAR","TAF"]},
+    {"id":"ZGSZ","icaoId":"ZGSZ","iataId":"SZX","faaId":null,"wmoId":"59493","site":"Shenzhen/Boan Intl","lat":22.639,"lon":113.803,"elev":18,"state":"GD","country":"CN","priority":5,"siteType":["METAR","TAF"]},
+    {"id":"ZSPD","icaoId":"ZSPD","iataId":"PVG","faaId":null,"wmoId":null,"site":"Shanghai/Pudong Intl","lat":31.146,"lon":121.8,"elev":4,"state":"SH","country":"CN","priority":6,"siteType":["METAR","TAF"]}
+  ]
+}

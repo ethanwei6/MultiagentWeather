@@ -9,9 +9,15 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from daily_weather_pipeline.backtesting_engine import (
     ANTI_OVERFIT_VALIDATION_SCHEMA,
+    Gen2ValidationVariantSpec,
+    Gen2ValidationVariantState,
+    _score_frame_for_throughput,
+    _build_candidate_weather_model_runner,
     BACKTEST_REPORT_SCHEMA,
     ConservativeFVEdgeConfig,
     ConservativeFVEdgeStrategy,
@@ -69,6 +75,7 @@ from daily_weather_pipeline.backtesting_engine import (
     OLD_NO_TAIL_LIVE_FORWARD_SHADOW_PROFILE_KEY,
     evaluate_universal_gates,
     old_no_tail_live_forward_shadow_spec,
+    run_candidate_replay,
     run_old_no_tail_live_forward_shadow_logging,
     run_conservative_fv_edge_candidate_replay,
     run_conservative_fv_edge_throughput_diagnostic,
@@ -80,6 +87,7 @@ from daily_weather_pipeline.backtesting_engine import (
     _quote_with_worse_fill_tick,
     _write_gen2_strategy_validation_csvs,
 )
+from daily_weather_pipeline.venue_execution import OFFICIAL_WEATHER_FEE_SCHEDULE_SOURCE, VenueExecutionConstraints
 from daily_weather_pipeline.cli import _ensure_decision_schema
 
 
@@ -994,6 +1002,149 @@ class BacktestingEngineTests(unittest.TestCase):
         self.assertEqual(released, 1)
         self.assertTrue(state.reserve(second).passed)
 
+    def test_portfolio_state_blocks_joint_total_reserved_bankroll_breach(self) -> None:
+        caps = PortfolioCaps(
+            bankroll_usd=10.0,
+            total_reserved_bankroll_fraction=1.0,
+            window_bankroll_fraction=2.0,
+            per_position_window_fraction=1.0,
+            per_city_date_total_fraction=2.0,
+            per_region_total_fraction=2.0,
+            per_token_side_total_fraction=2.0,
+            per_settlement_source_total_fraction=2.0,
+            max_primary_exposures_per_city_date_per_run=10,
+        )
+        state = PortfolioState(caps)
+        release_time = datetime(2026, 1, 3, 12, tzinfo=timezone.utc)
+
+        orders = [
+            ExposureIntent(
+                token_id=f"token-{index}",
+                side="YES",
+                city=f"City {index}",
+                market_date_local="2026-01-02",
+                region="Region",
+                settlement_source_family="Wunderground",
+                decision_hour_utc=12,
+                notional_usd=4.0,
+                release_time_utc=release_time,
+            )
+            for index in range(3)
+        ]
+
+        self.assertTrue(state.reserve(orders[0]).passed)
+        self.assertTrue(state.reserve(orders[1]).passed)
+        third_result = state.reserve(orders[2])
+
+        self.assertFalse(third_result.passed)
+        self.assertEqual(third_result.skip_reasons, (SkipReason.TOTAL_RESERVED_CAP_EXCEEDED,))
+        self.assertEqual(len(state.exposures), 2)
+        self.assertAlmostEqual(state.summary()["peak_concurrent_reserved_capital_usd"], 8.0)
+        self.assertAlmostEqual(state.summary()["minimum_cash_balance_usd"], 2.0)
+        self.assertEqual(
+            state.summary()["rejected_orders_by_cap_reason"],
+            {SkipReason.TOTAL_RESERVED_CAP_EXCEEDED.value: 1},
+        )
+        self.assertEqual(state.summary()["insolvency_attempts"], 1)
+
+    def test_portfolio_state_holds_cash_until_release_time(self) -> None:
+        caps = PortfolioCaps(
+            bankroll_usd=10.0,
+            total_reserved_bankroll_fraction=1.0,
+            window_bankroll_fraction=2.0,
+            per_position_window_fraction=1.0,
+            per_city_date_total_fraction=2.0,
+            per_region_total_fraction=2.0,
+            per_token_side_total_fraction=2.0,
+            per_settlement_source_total_fraction=2.0,
+            max_primary_exposures_per_city_date_per_run=10,
+        )
+        state = PortfolioState(caps)
+        first = ExposureIntent(
+            token_id="token-a",
+            side="NO",
+            city="London, GB",
+            market_date_local="2026-01-02",
+            region="Europe",
+            settlement_source_family="Wunderground",
+            decision_hour_utc=12,
+            notional_usd=7.0,
+            release_time_utc=datetime(2026, 1, 3, 12, tzinfo=timezone.utc),
+        )
+        second = replace(
+            first,
+            token_id="token-b",
+            city="Paris, FR",
+            notional_usd=4.0,
+            release_time_utc=datetime(2026, 1, 4, 12, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(state.reserve(first).passed)
+        self.assertFalse(state.reserve(second).passed)
+        self.assertEqual(state.release_expired(datetime(2026, 1, 3, 11, 59, tzinfo=timezone.utc)), 0)
+        self.assertFalse(state.reserve(second).passed)
+        self.assertEqual(state.release_expired(datetime(2026, 1, 3, 12, 1, tzinfo=timezone.utc)), 1)
+        self.assertTrue(state.reserve(second).passed)
+        self.assertAlmostEqual(state.summary()["minimum_cash_balance_usd"], 3.0)
+
+    def test_candidate_replay_batch_orders_are_checked_against_updated_cash_state(self) -> None:
+        class BatchStrategy:
+            name = "batch_strategy"
+
+            def evaluate(self, snapshot: StrategyInput) -> StrategyDecision:
+                return StrategyDecision(
+                    orders=tuple(
+                        OrderIntent(
+                            strategy_name=self.name,
+                            decision_id=snapshot.decision_id,
+                            token_id=f"token-{index}",
+                            side=snapshot.side,
+                            action=OrderAction.BUY,
+                            requested_notional_usd=4.0,
+                            limit_price=snapshot.quote.ask,
+                            reason="synthetic batch order",
+                        )
+                        for index in range(3)
+                    )
+                )
+
+        decision = _decision("row-batch")
+        frame = _frame(
+            decision=decision,
+            score=_score_with_observed_high_and_heat_window(),
+            label=_label("row-batch"),
+        )
+        caps = PortfolioCaps(
+            bankroll_usd=10.0,
+            total_reserved_bankroll_fraction=1.0,
+            window_bankroll_fraction=2.0,
+            per_position_window_fraction=1.0,
+            per_city_date_total_fraction=2.0,
+            per_region_total_fraction=2.0,
+            per_token_side_total_fraction=2.0,
+            per_settlement_source_total_fraction=2.0,
+            max_primary_exposures_per_city_date_per_run=10,
+        )
+
+        run = run_candidate_replay(
+            _ListFrameDataset([frame]),
+            BatchStrategy(),
+            strategy_config=ConservativeFVEdgeConfig(),
+            starting_cash_usd=10.0,
+            execute_orders=False,
+            portfolio_caps=caps,
+        )
+
+        self.assertEqual(len(run.order_intents), 2)
+        portfolio = run.report["portfolio_state"]
+        self.assertAlmostEqual(portfolio["peak_concurrent_reserved_capital_usd"], 8.0)
+        self.assertAlmostEqual(portfolio["minimum_cash_balance_usd"], 2.0)
+        self.assertEqual(
+            portfolio["rejected_orders_by_cap_reason"],
+            {SkipReason.TOTAL_RESERVED_CAP_EXCEEDED.value: 1},
+        )
+        self.assertEqual(portfolio["insolvency_attempts"], 1)
+
     def test_gen2_validation_is_deterministic_for_identical_synthetic_inputs(self) -> None:
         decision = replace(
             _decision(
@@ -1341,6 +1492,13 @@ class BacktestingEngineTests(unittest.TestCase):
         self.assertTrue(event["decision"]["would_trade"])
         self.assertEqual(event["decision"]["would_trade_signal"]["requested_notional_usd"], 2.0)
         self.assertEqual(event["decision"]["would_trade_signal"]["side"], "NO")
+        self.assertEqual(payload["pre_trade_gate"]["checked_would_trade_signals"], 1)
+        self.assertTrue(payload["pre_trade_gate"]["mandatory_before_future_order_adapter"])
+        self.assertFalse(payload["pre_trade_gate"]["order_submission_code_path_invoked"])
+        self.assertEqual(payload["pre_trade_gate"]["real_orders_placed"], 0)
+        self.assertTrue(event["pre_trade_gate"]["pre_trade_gate_checked"])
+        self.assertFalse(event["pre_trade_gate"]["order_submission_code_path_invoked"])
+        self.assertEqual(event["pre_trade_gate"]["real_orders_placed"], 0)
         self.assertEqual(event["quote"]["top_of_book_depth"]["ask_size"], 120.0)
         self.assertEqual(event["open_meteo_forecast"]["source_name"], "open_meteo_historical_forecast")
         self.assertEqual(event["model_output"]["p_no"], 0.95)
@@ -1418,6 +1576,460 @@ class BacktestingEngineTests(unittest.TestCase):
         self.assertIn("no_pnl_statement", VALIDATION_ONLY_REPORT_SCHEMA["required_sections"])
         self.assertIn("anti_overfit_readiness", VALIDATION_ONLY_REPORT_SCHEMA["required_sections"])
         self.assertTrue(md_path.name.endswith("-backtesting-framework-contracts.md"))
+
+    def test_gen2_terminal_no_fill_is_not_committed_before_next_candidate(self) -> None:
+        class AlwaysFOKStrategy:
+            name = "always_fok"
+
+            def evaluate(self, snapshot: StrategyInput) -> StrategyDecision:
+                return StrategyDecision(
+                    orders=(
+                        OrderIntent(
+                            strategy_name=self.name,
+                            decision_id=snapshot.decision_id,
+                            token_id=snapshot.token_id,
+                            side=snapshot.side,
+                            action=OrderAction.BUY,
+                            requested_notional_usd=2.0,
+                            limit_price=snapshot.quote.ask,
+                            order_type="FOK",
+                            reason="portfolio no-fill lifecycle fixture",
+                        ),
+                    )
+                )
+
+        class DelayedQuoteLookup:
+            def __init__(self, quotes: dict[str, QuoteSnapshot]) -> None:
+                self.quotes = quotes
+
+            def quote_after(
+                self,
+                *,
+                token_id: str,
+                earliest_time_utc: datetime,
+                max_wait_seconds: int,
+            ) -> QuoteSnapshot | None:
+                quote = self.quotes.get(token_id)
+                return (
+                    replace(quote, timestamp_utc=earliest_time_utc)
+                    if quote is not None
+                    else None
+                )
+
+        caps = PortfolioCaps(
+            bankroll_usd=2.0,
+            total_reserved_bankroll_fraction=1.0,
+            window_bankroll_fraction=2.0,
+            per_position_window_fraction=1.0,
+            per_city_date_total_fraction=2.0,
+            per_region_total_fraction=2.0,
+            per_token_side_total_fraction=2.0,
+            per_settlement_source_total_fraction=2.0,
+            max_primary_exposures_per_city_date_per_run=10,
+        )
+        spec = Gen2ValidationVariantSpec(
+            key="terminal-no-fill-fixture",
+            label="Terminal no-fill fixture",
+            stage="test",
+            strategy_family="test",
+            strategy=AlwaysFOKStrategy(),
+            config_report={},
+            portfolio_caps=caps,
+            parameters={},
+        )
+
+        for expected_status in (
+            "insufficient_visible_size",
+            "venue_execution_ineligible",
+        ):
+            with self.subTest(expected_status=expected_status):
+                venue_constrained = expected_status == "venue_execution_ineligible"
+                fee_config = (
+                    FeeModelConfig(
+                        fee_model=FEE_MODEL_POLYMARKET_WEATHER_TAKER,
+                        fee_rate=0.05,
+                    )
+                    if venue_constrained
+                    else FeeModelConfig()
+                )
+                fill_policy = FillPolicy(
+                    enforce_venue_constraints=venue_constrained,
+                    require_full_book_execution=venue_constrained,
+                    allow_historical_resting_ask_tick_policy=venue_constrained,
+                )
+                state = Gen2ValidationVariantState(
+                    spec=spec,
+                    starting_cash_usd=2.0,
+                    fee_config=fee_config,
+                    fill_policy=fill_policy,
+                )
+                first_time = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+                second_time = first_time + timedelta(minutes=1)
+
+                def executable_quote(
+                    *,
+                    timestamp: datetime,
+                    ask_size: float,
+                    execution_proven: bool,
+                ) -> QuoteSnapshot:
+                    return replace(
+                        _quote(
+                            timestamp_utc=timestamp - timedelta(seconds=1),
+                            bid=0.78,
+                            ask=0.80,
+                            spread=0.02,
+                            ask_size=ask_size,
+                        ),
+                        direct_polymarket_resting_ask_provenance=True,
+                        raw_compact_decision_passthrough_verified=execution_proven,
+                        price_transformation_applied=False,
+                    )
+
+                first_quote = executable_quote(
+                    timestamp=first_time,
+                    ask_size=10.0 if venue_constrained else 1.0,
+                    execution_proven=not venue_constrained,
+                )
+                second_quote = executable_quote(
+                    timestamp=second_time,
+                    ask_size=10.0,
+                    execution_proven=True,
+                )
+                constraints = (
+                    VenueExecutionConstraints(
+                        min_order_size_shares=5.0,
+                        tick_size=None,
+                        fee_rate=0.05,
+                        fee_rate_source=OFFICIAL_WEATHER_FEE_SCHEDULE_SOURCE,
+                    )
+                    if venue_constrained
+                    else None
+                )
+
+                def replay_frame(
+                    *,
+                    row_id: str,
+                    token_id: str,
+                    decision_time: datetime,
+                    quote: QuoteSnapshot,
+                ):
+                    decision = replace(
+                        _decision(row_id, bucket_type="above", quote=quote),
+                        decision_id=f"decision-{row_id}",
+                        universe_row_id=row_id,
+                        token_id=token_id,
+                        no_token_id=token_id,
+                        side="NO",
+                        decision_time_utc=decision_time,
+                        venue_execution_constraints=constraints,
+                    )
+                    return _frame(
+                        decision=decision,
+                        score=_score(
+                            side="NO",
+                            p_yes=0.04,
+                            p_side=0.96,
+                            model_agreement=1.0,
+                        ),
+                        label=_label(row_id, canonical_label=0),
+                    )
+
+                first = replay_frame(
+                    row_id=f"{expected_status}-first",
+                    token_id=f"{expected_status}-token-a",
+                    decision_time=first_time,
+                    quote=first_quote,
+                )
+                second = replay_frame(
+                    row_id=f"{expected_status}-second",
+                    token_id=f"{expected_status}-token-b",
+                    decision_time=second_time,
+                    quote=second_quote,
+                )
+                delayed_lookup = DelayedQuoteLookup(
+                    {
+                        first.decision.token_id: first_quote,
+                        second.decision.token_id: second_quote,
+                    }
+                )
+                process_kwargs = {
+                    "delayed_quote_lookup": delayed_lookup,
+                    "delay_seconds": 2,
+                    "delayed_quote_max_wait_seconds": 60,
+                    "worse_fill_tick": 0.01,
+                }
+
+                state.process_frame(first, **process_kwargs)
+
+                self.assertEqual(state.fill_status_counts[expected_status], 1)
+                for portfolio in (
+                    state.portfolio_state,
+                    state.delayed_portfolio_state,
+                    state.worse_fill_portfolio_state,
+                ):
+                    after_no_fill = portfolio.summary()
+                    self.assertEqual(after_no_fill["reserved_exposure_count"], 0)
+                    self.assertEqual(after_no_fill["committed_reservations"], 0)
+                    self.assertEqual(
+                        after_no_fill["no_fill_reservations_not_committed"],
+                        1,
+                    )
+                    self.assertAlmostEqual(after_no_fill["minimum_cash_balance_usd"], 2.0)
+
+                state.process_frame(second, **process_kwargs)
+
+                self.assertEqual(len(state.order_intents), 2)
+                self.assertEqual(
+                    len(state.ledger.fills),
+                    1,
+                    dict(state.fill_status_counts),
+                )
+                self.assertEqual(state.ledger.fills[0].token_id, second.decision.token_id)
+                self.assertEqual(state.cap_block_counts, {})
+                for portfolio in (
+                    state.portfolio_state,
+                    state.delayed_portfolio_state,
+                    state.worse_fill_portfolio_state,
+                ):
+                    summary = portfolio.summary()
+                    self.assertEqual(summary["reserve_attempts"], 2)
+                    self.assertEqual(summary["accepted_reservations"], 2)
+                    self.assertEqual(summary["committed_reservations"], 1)
+                    self.assertEqual(
+                        summary["no_fill_reservations_not_committed"],
+                        1,
+                    )
+                    self.assertEqual(summary["reserved_exposure_count"], 1)
+                    self.assertAlmostEqual(summary["reserved_notional_usd"], 2.0)
+                    self.assertAlmostEqual(summary["peak_cash_usage_usd"], 2.0)
+                    self.assertAlmostEqual(summary["minimum_cash_balance_usd"], 0.0)
+                    self.assertEqual(portfolio.exposures[0].token_id, second.decision.token_id)
+                self.assertIsNot(state.portfolio_state, state.delayed_portfolio_state)
+                self.assertIsNot(state.portfolio_state, state.worse_fill_portfolio_state)
+
+    def test_conservative_reservation_cap_preserves_allocated_cash_and_is_not_insolvency(self) -> None:
+        caps = PortfolioCaps(
+            bankroll_usd=100.0,
+            total_reserved_bankroll_fraction=0.80,
+            window_bankroll_fraction=1.0,
+            per_position_window_fraction=1.0,
+            per_city_date_total_fraction=1.0,
+            per_region_total_fraction=1.0,
+            per_token_side_total_fraction=1.0,
+            per_settlement_source_total_fraction=1.0,
+            max_primary_exposures_per_city_date_per_run=100,
+        )
+        state = PortfolioState(caps)
+
+        accepted = ExposureIntent(
+            token_id="accepted-token",
+            side="NO",
+            city="city-a",
+            market_date_local="2026-07-14",
+            region="region-a",
+            settlement_source_family="source-a",
+            decision_hour_utc=12,
+            notional_usd=80.0,
+        )
+        rejected_by_reserve_cap = replace(
+            accepted,
+            token_id="cap-rejected-token",
+            city="city-b",
+            notional_usd=1.0,
+        )
+
+        self.assertTrue(state.reserve(accepted).passed)
+        result = state.evaluate_reservation(rejected_by_reserve_cap)
+
+        self.assertFalse(result.passed)
+        self.assertIn(SkipReason.TOTAL_RESERVED_CAP_EXCEEDED, result.skip_reasons)
+        self.assertAlmostEqual(
+            result.exposures_after["allocated_cash_unreserved_usd"],
+            19.0,
+        )
+        self.assertAlmostEqual(
+            result.exposures_after["reservation_capacity_remaining_usd"],
+            -1.0,
+        )
+        summary = state.summary()
+        self.assertAlmostEqual(summary["allocated_cash_unreserved_usd"], 20.0)
+        self.assertAlmostEqual(
+            summary["minimum_allocated_cash_unreserved_usd"],
+            20.0,
+        )
+        self.assertAlmostEqual(summary["reservation_capacity_remaining_usd"], 0.0)
+        self.assertEqual(summary["insolvency_attempts"], 0)
+
+    def test_generated_score_clears_only_stale_score_skip_reasons(self) -> None:
+        decision = _decision("generated-score-clears-stale-skip", bucket_type="above")
+        frame = replace(
+            _frame(decision=decision),
+            score=None,
+            skip_reasons=(
+                SkipReason.MISSING_SHARED_SCORE,
+                SkipReason.NOT_IN_FROZEN_DECISIVE_CANDIDATE_SET,
+            ),
+        )
+
+        scored, generated, missing, firewall_violation = _score_frame_for_throughput(
+            frame,
+            model_runner=DeterministicFixtureWeatherModelRunner(),
+            score_cache=ReplayGeneratedScoreCache(),
+            point_policy=PointInTimePolicy(require_shared_score=True),
+        )
+
+        self.assertIsNotNone(scored.score)
+        self.assertTrue(generated)
+        self.assertFalse(missing)
+        self.assertFalse(firewall_violation)
+        self.assertNotIn(SkipReason.MISSING_SHARED_SCORE, scored.skip_reasons)
+        self.assertIn(
+            SkipReason.NOT_IN_FROZEN_DECISIVE_CANDIDATE_SET,
+            scored.skip_reasons,
+        )
+
+    def test_decision_loader_preserves_explicit_false_over_conflicting_fallback_fields(
+        self,
+    ) -> None:
+        base_row = {
+            "decision_id": "decision-loader-presence",
+            "universe_row_id": "row-loader-presence",
+            "token_id": "token-no",
+            "side": "NO",
+            "decision_time_utc": "2026-01-02T12:00:00+00:00",
+            "quote_timestamp_utc": "2026-01-02T11:59:00+00:00",
+            "bid": 0.81,
+            "ask": 0.82,
+            "bid_size": 10.0,
+            "ask_size": 10.0,
+            "quote_source_payload_id": "direct-polymarket-quote",
+            "quote_source_cache_path": "raw/polymarket/quotes.jsonl.gz",
+            "quote_direct_polymarket_resting_ask_provenance": False,
+            "direct_polymarket_resting_ask_provenance": True,
+            "quote_raw_compact_decision_passthrough_verified": False,
+            "raw_compact_decision_passthrough_verified": True,
+            "quote_price_transformation_applied": False,
+            "price_transformation_applied": True,
+        }
+
+        preferred_false = DecisionSnapshot.from_sqlite_row(base_row)
+        preferred_true = DecisionSnapshot.from_sqlite_row(
+            {
+                **base_row,
+                "quote_direct_polymarket_resting_ask_provenance": True,
+                "direct_polymarket_resting_ask_provenance": False,
+                "quote_raw_compact_decision_passthrough_verified": True,
+                "raw_compact_decision_passthrough_verified": False,
+                "quote_price_transformation_applied": True,
+                "price_transformation_applied": False,
+            }
+        )
+
+        self.assertIsNotNone(preferred_false.quote)
+        self.assertFalse(
+            preferred_false.quote.direct_polymarket_resting_ask_provenance
+        )
+        self.assertFalse(
+            preferred_false.quote.raw_compact_decision_passthrough_verified
+        )
+        self.assertIs(preferred_false.quote.price_transformation_applied, False)
+        self.assertTrue(
+            preferred_true.quote.direct_polymarket_resting_ask_provenance
+        )
+        self.assertTrue(
+            preferred_true.quote.raw_compact_decision_passthrough_verified
+        )
+        self.assertIs(preferred_true.quote.price_transformation_applied, True)
+
+    def test_point_in_time_policy_uses_explicit_replay_quote_age(self) -> None:
+        decision = _decision(
+            "row-quote-age",
+            quote_time=datetime(2026, 1, 2, 11, 58, 59, tzinfo=timezone.utc),
+        )
+        label = _label("row-quote-age")
+
+        strict = PointInTimePolicy(max_quote_staleness_seconds=60).skip_reasons(
+            decision,
+            label,
+        )
+        sensitivity = PointInTimePolicy(
+            max_quote_staleness_seconds=120
+        ).skip_reasons(decision, label)
+
+        self.assertIn(SkipReason.STALE_QUOTE, strict)
+        self.assertNotIn(SkipReason.STALE_QUOTE, sensitivity)
+
+    def test_immutable_sqlite_loader_rejects_sidecars_and_leaves_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frozen-decision.sqlite"
+            with sqlite3.connect(path) as conn:
+                _ensure_decision_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO decision_artifact_scope(
+                        scope_id, target_start_date, target_end_date, price_store,
+                        max_staleness_minutes, built_at_utc, row_count
+                    )
+                    VALUES ('current', '2026-01-01', '2026-01-02', 'compact', 90, 'now', 0)
+                    """
+                )
+                conn.commit()
+            wal_path = Path(f"{path}-wal")
+            shm_path = Path(f"{path}-shm")
+            wal_path.write_bytes(b"ambiguous-uncheckpointed-state")
+
+            with self.assertRaisesRegex(RuntimeError, "WAL/SHM sidecars"):
+                list(
+                    SQLiteDecisionArtifactLoader(
+                        path,
+                        immutable=True,
+                    ).iter_decisions(limit=1)
+                )
+
+            wal_path.unlink()
+            rows = list(
+                SQLiteDecisionArtifactLoader(path, immutable=True).iter_decisions(
+                    limit=1
+                )
+            )
+            self.assertEqual(rows, [])
+            self.assertFalse(wal_path.exists())
+            self.assertFalse(shm_path.exists())
+
+    def test_observed_high_runner_pins_verified_corpus_snapshot(self) -> None:
+        snapshot_id = "a" * 64
+        resolution = SimpleNamespace(snapshot_id=snapshot_id)
+        runner = MagicMock()
+        with patch(
+            "daily_weather_pipeline.weather_model_runner.ObservedHighGuardedShrinkageWeatherModelRunner",
+            return_value=runner,
+        ), patch(
+            "daily_weather_pipeline.weather_corpus_snapshot.resolve_corpus_snapshot",
+            return_value=resolution,
+        ) as resolver:
+            built = _build_candidate_weather_model_runner(
+                "observed-high-guarded",
+                work_root=Path("."),
+                corpus_snapshot_id=snapshot_id,
+            )
+
+        self.assertIs(built, runner)
+        self.assertIs(runner._pinned_corpus_resolution, resolution)
+        resolver.assert_called_once()
+
+        with patch(
+            "daily_weather_pipeline.weather_model_runner.ObservedHighGuardedShrinkageWeatherModelRunner",
+            return_value=MagicMock(),
+        ), patch(
+            "daily_weather_pipeline.weather_corpus_snapshot.resolve_corpus_snapshot",
+            return_value=SimpleNamespace(snapshot_id="b" * 64),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
+                _build_candidate_weather_model_runner(
+                    "observed-high-guarded",
+                    work_root=Path("."),
+                    corpus_snapshot_id=snapshot_id,
+                )
 
 
 class _ListDecisionLoader:

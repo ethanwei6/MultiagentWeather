@@ -6,6 +6,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+build/
+*.egg-info/
 
 # Local OS/editor files
 .DS_Store
@@ -50,3 +52,41 @@ memory*.md
 .codex/
 .agents/
 
+
+# Frontend dependencies and local build state
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+.npmrc
+.npm/
+.vercel/
+.openai/
+.sites-runtime/
+.wrangler/
+.dev.vars*
+outputs/
+
+# Local databases, private exports, and archives
+*.sqlite3
+*.db-shm
+*.db-wal
+*.sqlite-journal
+*.tar.gz
+*.tgz
+*.zip
+*.keystore
+*.p8
+*.kdbx
+ssh_config
+id_rsa
+id_ed25519
+wallets/
+
+# The demo exposes only the three reviewed fixture files.
+showcase/public/*.json
+!showcase/public/results.json
+!showcase/public/evidence.json
+!showcase/public/model-evaluation.json

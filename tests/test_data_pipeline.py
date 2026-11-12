@@ -131,7 +131,7 @@ class DataPipelineTests(unittest.TestCase):
     def test_global_failure_classifier_does_not_read_asset_id_as_auth(self) -> None:
         error = (
             "RuntimeError: HTTP 404 for https://api.telonex.io/v1/downloads/polymarket/quotes/"
-            "2026-04-10?asset_id=69659477885944328446785987403969580652638789456591358445872575554236683213471"
+            "2026-04-10?asset_id=11111111111111114011111111111111114031111111111"
         )
         self.assertEqual(_global_failure_class(error), "http_404")
 

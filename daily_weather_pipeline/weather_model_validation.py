@@ -8,6 +8,7 @@ import math
 import sqlite3
 import sys
 from collections import defaultdict
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -15,8 +16,10 @@ from statistics import mean, pstdev
 from typing import Any, Callable, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
+from .cli import DEFAULT_SOURCE_REPO
+from .weather_corpus_snapshot import reject_corpus_database_sidecars
 
-DEFAULT_SOURCE_REPO = Path("/Users/ethanwei/Documents/Codex/2026-06-04/i-want-to-explore-a-few")
+
 DEFAULT_START_DATE = "2025-10-13"
 DEFAULT_END_DATE = "2026-06-29"
 EPSILON = 1e-6
@@ -124,6 +127,21 @@ class DecisionQuoteRow:
     price_stale_seconds: Optional[float]
     resolved_outcome_yes: int
     quote_quality_flags: tuple[str, ...]
+
+
+def resolve_training_corpus_end_date(
+    end_date: Optional[date | str] = None,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> date:
+    if end_date is not None:
+        if isinstance(end_date, date):
+            return end_date
+        return date.fromisoformat(str(end_date))
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc).date()
 
 
 class ReliabilityCalibrator:
@@ -357,52 +375,232 @@ def _artifact_paths(work_root: Path) -> dict[str, Path]:
     }
 
 
+def _is_weather_strategy_module_name(name: str) -> bool:
+    return name == "weather_strategy" or name.startswith("weather_strategy.")
+
+
+def _resolved_module_origin_path(value: Any, *, module_name: str) -> Path:
+    try:
+        return Path(value).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "weather_strategy module origin is missing or unreadable: "
+            f"{module_name}:{value!r}"
+        ) from exc
+
+
+def _module_origin_paths(module_name: str, module: Any) -> set[Path]:
+    if module is None:
+        raise RuntimeError(
+            f"weather_strategy module origin is unprovable: {module_name}:None"
+        )
+    origins: set[Path] = set()
+    module_file = getattr(module, "__file__", None)
+    if module_file:
+        origins.add(
+            _resolved_module_origin_path(module_file, module_name=module_name)
+        )
+
+    spec = getattr(module, "__spec__", None)
+    spec_origin = getattr(spec, "origin", None)
+    if spec_origin and str(spec_origin).lower() not in {
+        "built-in",
+        "frozen",
+        "namespace",
+    }:
+        origins.add(
+            _resolved_module_origin_path(spec_origin, module_name=module_name)
+        )
+
+    package_paths = getattr(module, "__path__", None)
+    if package_paths is None and spec is not None:
+        package_paths = getattr(spec, "submodule_search_locations", None)
+    if package_paths is not None:
+        try:
+            for package_path in package_paths:
+                origins.add(
+                    _resolved_module_origin_path(
+                        package_path,
+                        module_name=module_name,
+                    )
+                )
+        except TypeError as exc:
+            raise RuntimeError(
+                f"weather_strategy package path is unprovable: {module_name}"
+            ) from exc
+    if not origins:
+        raise RuntimeError(
+            f"weather_strategy module origin is unprovable: {module_name}"
+        )
+    return origins
+
+
+def _assert_weather_strategy_module_origins(package_root: Path) -> None:
+    expected_root = Path(package_root).resolve(strict=True)
+    for module_name, module in sorted(sys.modules.items()):
+        if not _is_weather_strategy_module_name(module_name):
+            continue
+        for origin in _module_origin_paths(module_name, module):
+            try:
+                origin.relative_to(expected_root)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "weather_strategy module resolved outside the exact vendored "
+                    f"package tree: {module_name}:{origin}:expected={expected_root}"
+                ) from exc
+
+
+def _resolved_sys_path_entry(value: Any) -> Optional[Path]:
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _load_weather_strategy(source_repo: Path) -> dict[str, Any]:
-    if not source_repo.exists():
-        raise FileNotFoundError(f"Source repo not found: {source_repo}")
-    sys.path.insert(0, str(source_repo))
-    from weather_strategy.forecast import (  # type: ignore
-        ConsensusForecastEngine,
-        EmpiricalEnsembleModel,
-        FeatureAwareNormalModel,
-        HourlyCurveMaxModel,
-        KernelSmoothingModel,
-        ParametricNormalModel,
-    )
-    from weather_strategy.models import CityConfig, ForecastDistribution, TemperatureBucket  # type: ignore
+    try:
+        resolved_source_repo = Path(source_repo).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Source repo not found: {source_repo}") from exc
+    if not resolved_source_repo.is_dir():
+        raise FileNotFoundError(f"Source repo is not a directory: {source_repo}")
+    package_path = resolved_source_repo / "weather_strategy"
+    if package_path.is_symlink():
+        raise RuntimeError(
+            f"weather_strategy package may not be a symlink: {package_path}"
+        )
+    try:
+        package_root = package_path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"weather_strategy package not found in source repo: {package_path}"
+        ) from exc
+    if not package_root.is_dir() or package_root.parent != resolved_source_repo:
+        raise RuntimeError(
+            "weather_strategy package must be the exact source_repo/weather_strategy "
+            f"directory: {package_root}"
+        )
 
-    engine = ConsensusForecastEngine()
-    models = (
-        EmpiricalEnsembleModel(),
-        KernelSmoothingModel(sigma_floor_f=1.5, name="kernel_tight"),
-        KernelSmoothingModel(sigma_floor_f=3.0, name="kernel_wide"),
-        ParametricNormalModel(sigma_floor_f=2.0, sigma_multiplier=1.0, name="normal_parametric"),
-        ParametricNormalModel(sigma_floor_f=4.0, sigma_multiplier=1.75, name="normal_conservative"),
-        FeatureAwareNormalModel(sigma_floor_f=3.0),
-        HourlyCurveMaxModel(sigma_floor_f=2.5),
-    )
-    return {
-        "CityConfig": CityConfig,
-        "ForecastDistribution": ForecastDistribution,
-        "TemperatureBucket": TemperatureBucket,
-        "models": models,
-        "source_weights": dict(engine.source_weights),
-        "model_weights": dict(engine.model_weights),
+    original_sys_path = list(sys.path)
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_weather_strategy_module_name(name)
     }
+    sys.path[:] = [
+        str(resolved_source_repo),
+        *[
+            entry
+            for entry in original_sys_path
+            if _resolved_sys_path_entry(entry) != resolved_source_repo
+        ],
+    ]
+    try:
+        _assert_weather_strategy_module_origins(package_root)
+        from weather_strategy.forecast import (  # type: ignore
+            ConsensusForecastEngine,
+            EmpiricalEnsembleModel,
+            FeatureAwareNormalModel,
+            HourlyCurveMaxModel,
+            KernelSmoothingModel,
+            ParametricNormalModel,
+        )
+        from weather_strategy.models import (  # type: ignore
+            CityConfig,
+            ForecastDistribution,
+            TemperatureBucket,
+        )
+
+        engine = ConsensusForecastEngine()
+        models = (
+            EmpiricalEnsembleModel(),
+            KernelSmoothingModel(sigma_floor_f=1.5, name="kernel_tight"),
+            KernelSmoothingModel(sigma_floor_f=3.0, name="kernel_wide"),
+            ParametricNormalModel(
+                sigma_floor_f=2.0,
+                sigma_multiplier=1.0,
+                name="normal_parametric",
+            ),
+            ParametricNormalModel(
+                sigma_floor_f=4.0,
+                sigma_multiplier=1.75,
+                name="normal_conservative",
+            ),
+            FeatureAwareNormalModel(sigma_floor_f=3.0),
+            HourlyCurveMaxModel(sigma_floor_f=2.5),
+        )
+        _assert_weather_strategy_module_origins(package_root)
+        return {
+            "CityConfig": CityConfig,
+            "ForecastDistribution": ForecastDistribution,
+            "TemperatureBucket": TemperatureBucket,
+            "models": models,
+            "source_weights": dict(engine.source_weights),
+            "model_weights": dict(engine.model_weights),
+        }
+    except Exception:
+        for name in tuple(sys.modules):
+            if _is_weather_strategy_module_name(name):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_modules)
+        raise
+    finally:
+        sys.path[:] = original_sys_path
 
 
-def _connect_readonly(path: Path) -> sqlite3.Connection:
+def _connect_readonly(
+    path: Path,
+    *,
+    immutable: bool = False,
+    reject_sidecars: bool = False,
+    sidecar_reason_prefix: str = "corpus_database",
+    allow_zero_length_wal: bool = False,
+) -> sqlite3.Connection:
     if not path.exists():
         raise FileNotFoundError(path)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA query_only=ON")
+    if reject_sidecars:
+        reject_corpus_database_sidecars(
+            path,
+            reason_prefix=sidecar_reason_prefix,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+    suffix = "&immutable=1" if immutable else ""
+    conn = sqlite3.connect(f"file:{path}?mode=ro{suffix}", uri=True, timeout=30)
+    try:
+        if reject_sidecars:
+            reject_corpus_database_sidecars(
+                path,
+                reason_prefix=sidecar_reason_prefix,
+                allow_zero_length_wal=allow_zero_length_wal,
+            )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA query_only=ON")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
-def _load_markets(path: Path, *, start: date, end: date) -> list[MarketRow]:
-    with _connect_readonly(path) as conn:
+def _load_markets(
+    path: Path,
+    *,
+    start: date,
+    end: date,
+    immutable: bool = False,
+    reject_sidecars: bool = False,
+    sidecar_reason_prefix: str = "corpus_database",
+    allow_zero_length_wal: bool = False,
+) -> list[MarketRow]:
+    with closing(
+        _connect_readonly(
+            path,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=sidecar_reason_prefix,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+    ) as conn:
         rows = conn.execute(
             """
             SELECT universe_row_id, normalized_city, country_region, latitude, longitude, timezone,
@@ -440,8 +638,25 @@ def _load_markets(path: Path, *, start: date, end: date) -> list[MarketRow]:
     ]
 
 
-def _load_forecasts(path: Path, *, start: date, end: date) -> list[ForecastRow]:
-    with _connect_readonly(path) as conn:
+def _load_forecasts(
+    path: Path,
+    *,
+    start: date,
+    end: date,
+    immutable: bool = False,
+    reject_sidecars: bool = False,
+    sidecar_reason_prefix: str = "corpus_database",
+    allow_zero_length_wal: bool = False,
+) -> list[ForecastRow]:
+    with closing(
+        _connect_readonly(
+            path,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=sidecar_reason_prefix,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+    ) as conn:
         rows = conn.execute(
             """
             SELECT forecast_id, normalized_city, country_region, latitude, longitude, timezone,
@@ -484,8 +699,25 @@ def _load_forecasts(path: Path, *, start: date, end: date) -> list[ForecastRow]:
     return forecasts
 
 
-def _load_realized(path: Path, *, start: date, end: date) -> dict[tuple[str, date], RealizedRow]:
-    with _connect_readonly(path) as conn:
+def _load_realized(
+    path: Path,
+    *,
+    start: date,
+    end: date,
+    immutable: bool = False,
+    reject_sidecars: bool = False,
+    sidecar_reason_prefix: str = "corpus_database",
+    allow_zero_length_wal: bool = False,
+) -> dict[tuple[str, date], RealizedRow]:
+    with closing(
+        _connect_readonly(
+            path,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=sidecar_reason_prefix,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+    ) as conn:
         rows = conn.execute(
             """
             SELECT normalized_city, local_date, temperature_2m_max_f, hourly_temperature_2m_max_f,
@@ -1497,7 +1729,7 @@ def _market_edge_diagnostics(
 def _load_decision_quotes(path: Path) -> list[DecisionQuoteRow]:
     if not path.exists():
         return []
-    with _connect_readonly(path) as conn:
+    with closing(_connect_readonly(path)) as conn:
         rows = conn.execute(
             """
             SELECT universe_row_id, decision_time_utc, side, forecast_source_name,

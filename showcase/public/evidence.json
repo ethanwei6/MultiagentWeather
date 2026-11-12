@@ -1,0 +1,258 @@
+{
+  "schemaVersion": 1,
+  "project": "DailyWeather public demonstration",
+  "synthetic": true,
+  "asOf": "2024-04-20T00:00:00Z",
+  "sourceDescription": "Fictional teaching dataset. All trades, dates, prices, probabilities, fills, and payouts in this file are synthetic.",
+  "cases": [
+    {
+      "id": "demo-tokyo-01",
+      "synthetic": true,
+      "city": "Tokyo, JP",
+      "eventDate": "2024-04-05",
+      "title": "Will the highest temperature in Tokyo be 18\u00b0C on April 5?",
+      "side": "NO",
+      "bucketType": "exact",
+      "station": "SIM-TOK",
+      "leadDays": 1,
+      "signalTime": "2024-04-04T12:00:17.250Z",
+      "quoteTime": "2024-04-04T12:00:00.000Z",
+      "quoteAgeAtEvaluationSeconds": 7.25,
+      "fillTime": "2024-04-04T12:00:40.250Z",
+      "reconciliationTime": "2024-04-06T12:15:15.000Z",
+      "modelProbability": 0.9878,
+      "quotedAsk": 0.735,
+      "grossEdge": 0.2528,
+      "fillPrice": 0.748,
+      "shares": 7.25,
+      "notionalUsd": 5.423,
+      "feeUsd": 0.029,
+      "costUsd": 5.452,
+      "payoutUsd": 7.25,
+      "pnlUsd": 1.798,
+      "outcome": "win",
+      "evidence": {
+        "signalSequence": 1000100,
+        "intentSequence": 1000101,
+        "fillSequence": 1000102,
+        "redemptionSequence": 1000103,
+        "settlementSequence": 1000104
+      },
+      "marketId": "illustration-1",
+      "strategyId": "synthetic-probability-gap",
+      "settlementValue": 1,
+      "featureTime": "2024-04-04T11:59:00.000Z",
+      "settlementTime": "2024-04-06T12:15:15.000Z",
+      "redemptionTime": "2024-04-06T12:15:00.000Z",
+      "quotedBid": 0.72,
+      "fee": 0.029,
+      "cost": 5.452,
+      "payout": 7.25,
+      "pnl": 1.798,
+      "observations": [
+        {
+          "time": "2024-04-04T00:00:00.000Z",
+          "ask": 0.71,
+          "bid": 0.695,
+          "modelProbability": null,
+          "sequence": 1000090
+        },
+        {
+          "time": "2024-04-04T12:00:00.000Z",
+          "ask": 0.735,
+          "bid": 0.72,
+          "modelProbability": 0.9878,
+          "sequence": 1000100
+        },
+        {
+          "time": "2024-04-04T16:00:00.000Z",
+          "ask": 0.745,
+          "bid": 0.73,
+          "modelProbability": 0.9728,
+          "sequence": 1000110
+        },
+        {
+          "time": "2024-04-04T20:00:00.000Z",
+          "ask": 0.77,
+          "bid": 0.755,
+          "modelProbability": 0.9948,
+          "sequence": 1000120
+        }
+      ],
+      "sources": [
+        "Synthetic forecast input A",
+        "Synthetic forecast input B"
+      ],
+      "evidenceType": "Synthetic signal, execution and payout example",
+      "forecastMean": null,
+      "residualSigma": null
+    },
+    {
+      "id": "demo-madrid-02",
+      "synthetic": true,
+      "city": "Madrid, ES",
+      "eventDate": "2024-04-06",
+      "title": "Will the highest temperature in Madrid be 24\u00b0C or higher on April 6?",
+      "side": "YES",
+      "bucketType": "above",
+      "station": "SIM-MAD",
+      "leadDays": 2,
+      "signalTime": "2024-04-04T12:00:18.500Z",
+      "quoteTime": "2024-04-04T12:00:00.000Z",
+      "quoteAgeAtEvaluationSeconds": 8.5,
+      "fillTime": "2024-04-04T12:00:41.500Z",
+      "reconciliationTime": "2024-04-07T12:15:15.000Z",
+      "modelProbability": 0.823,
+      "quotedAsk": 0.22,
+      "grossEdge": 0.603,
+      "fillPrice": 0.24,
+      "shares": 10.5,
+      "notionalUsd": 2.52,
+      "feeUsd": 0.042,
+      "costUsd": 2.562,
+      "payoutUsd": 10.5,
+      "pnlUsd": 7.938,
+      "outcome": "win",
+      "evidence": {
+        "signalSequence": 1000200,
+        "intentSequence": 1000201,
+        "fillSequence": 1000202,
+        "redemptionSequence": 1000203,
+        "settlementSequence": 1000204
+      },
+      "marketId": "illustration-2",
+      "strategyId": "synthetic-probability-gap",
+      "settlementValue": 1,
+      "featureTime": "2024-04-04T11:59:00.000Z",
+      "settlementTime": "2024-04-07T12:15:15.000Z",
+      "redemptionTime": "2024-04-07T12:15:00.000Z",
+      "quotedBid": 0.205,
+      "fee": 0.042,
+      "cost": 2.562,
+      "payout": 10.5,
+      "pnl": 7.938,
+      "observations": [
+        {
+          "time": "2024-04-04T00:00:00.000Z",
+          "ask": 0.195,
+          "bid": 0.18,
+          "modelProbability": 0.743,
+          "sequence": 1000190
+        },
+        {
+          "time": "2024-04-04T12:00:00.000Z",
+          "ask": 0.22,
+          "bid": 0.205,
+          "modelProbability": 0.823,
+          "sequence": 1000200
+        },
+        {
+          "time": "2024-04-04T16:00:00.000Z",
+          "ask": 0.23,
+          "bid": 0.215,
+          "modelProbability": 0.808,
+          "sequence": 1000210
+        },
+        {
+          "time": "2024-04-04T20:00:00.000Z",
+          "ask": 0.255,
+          "bid": 0.24,
+          "modelProbability": 0.83,
+          "sequence": 1000220
+        }
+      ],
+      "sources": [
+        "Synthetic forecast input A",
+        "Synthetic forecast input B"
+      ],
+      "evidenceType": "Synthetic signal, execution and payout example",
+      "forecastMean": null,
+      "residualSigma": null
+    },
+    {
+      "id": "demo-chicago-03",
+      "synthetic": true,
+      "city": "Chicago, IL",
+      "eventDate": "2024-04-07",
+      "title": "Will the highest temperature in Chicago be between 55\u201356\u00b0F on April 7?",
+      "side": "NO",
+      "bucketType": "range",
+      "station": "SIM-CHI",
+      "leadDays": 1,
+      "signalTime": "2024-04-06T12:00:19.750Z",
+      "quoteTime": "2024-04-06T12:00:00.000Z",
+      "quoteAgeAtEvaluationSeconds": 9.75,
+      "fillTime": "2024-04-06T12:00:42.750Z",
+      "reconciliationTime": "2024-04-08T12:15:15.000Z",
+      "modelProbability": 0.994,
+      "quotedAsk": 0.805,
+      "grossEdge": 0.189,
+      "fillPrice": 0.825,
+      "shares": 6.8,
+      "notionalUsd": 5.61,
+      "feeUsd": 0.0272,
+      "costUsd": 5.6372,
+      "payoutUsd": 0.0,
+      "pnlUsd": -5.6372,
+      "outcome": "loss",
+      "evidence": {
+        "signalSequence": 1000300,
+        "intentSequence": 1000301,
+        "fillSequence": 1000302,
+        "redemptionSequence": 1000303,
+        "settlementSequence": 1000304
+      },
+      "marketId": "illustration-3",
+      "strategyId": "synthetic-probability-gap",
+      "settlementValue": 0,
+      "featureTime": "2024-04-06T11:59:00.000Z",
+      "settlementTime": "2024-04-08T12:15:15.000Z",
+      "redemptionTime": "2024-04-08T12:15:00.000Z",
+      "quotedBid": 0.79,
+      "fee": 0.0272,
+      "cost": 5.6372,
+      "payout": 0.0,
+      "pnl": -5.6372,
+      "observations": [
+        {
+          "time": "2024-04-06T00:00:00.000Z",
+          "ask": 0.78,
+          "bid": 0.765,
+          "modelProbability": 0.914,
+          "sequence": 1000290
+        },
+        {
+          "time": "2024-04-06T12:00:00.000Z",
+          "ask": 0.805,
+          "bid": 0.79,
+          "modelProbability": 0.994,
+          "sequence": 1000300
+        },
+        {
+          "time": "2024-04-06T16:00:00.000Z",
+          "ask": 0.815,
+          "bid": 0.8,
+          "modelProbability": 0.979,
+          "sequence": 1000310
+        },
+        {
+          "time": "2024-04-06T20:00:00.000Z",
+          "ask": 0.84,
+          "bid": 0.825,
+          "modelProbability": 0.999,
+          "sequence": 1000320
+        }
+      ],
+      "sources": [
+        "Synthetic forecast input A",
+        "Synthetic forecast input B"
+      ],
+      "evidenceType": "Synthetic signal, execution and payout example",
+      "forecastMean": null,
+      "residualSigma": null
+    }
+  ],
+  "chartNote": "Quote history points, gaps and execution prices are assigned fictional examples.",
+  "pnlNote": "Assigned payout minus shares times fill price minus a synthetic trading fee of $0.004 per share.",
+  "selectionNote": "Three synthetic examples demonstrate a price change, a large winning payout and a loss."
+}

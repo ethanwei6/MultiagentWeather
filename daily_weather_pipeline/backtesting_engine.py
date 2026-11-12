@@ -4,6 +4,7 @@ import csv
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 import argparse
 import time
@@ -14,7 +15,18 @@ from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
+from urllib.parse import quote as url_quote
 from zoneinfo import ZoneInfo
+
+from daily_weather_pipeline.venue_execution import (
+    HISTORICAL_REPLAY_EXECUTION_CONTEXT,
+    HISTORICAL_RESTING_ASK_TICK_BASIS,
+    OFFICIAL_WEATHER_FEE_SCHEDULE_RATE,
+    OFFICIAL_WEATHER_FEE_SCHEDULE_SOURCE,
+    VenueExecutionAssessment,
+    VenueExecutionConstraints,
+    assess_venue_order,
+)
 
 
 BACKTEST_FRAMEWORK_SCHEMA_VERSION = "dailyweather.backtest.framework.v1"
@@ -42,6 +54,15 @@ DEFAULT_STRATEGY_REPLAY_FEE_RATE = DEFAULT_POLYMARKET_WEATHER_TAKER_FEE_RATE
 DEFAULT_DELAY_STRESS_SECONDS = 2
 DEFAULT_WORSE_FILL_TICK = 0.01
 GEN2_REPRODUCIBILITY_REQUIRED_RUNS = 3
+
+
+DEFAULT_MAX_REPLAY_QUOTE_AGE_SECONDS = 90 * 60
+
+DEFAULT_DELAYED_QUOTE_MAX_WAIT_SECONDS = 90 * 60
+
+DEFAULT_FIXED_WORSE_PRICE_DELTA_USD = 0.01
+
+FIXED_WORSE_PRICE_STRESS_SCENARIO = "fixed_0_01_worse_price_sensitivity"
 
 
 class SkipReason(str, Enum):
@@ -81,6 +102,7 @@ class SkipReason(str, Enum):
     BOUNDED_BUCKET_GATES_NOT_MET = "bounded_bucket_gates_not_met"
     SETTLEMENT_SOURCE_CONFLICT = "settlement_source_conflict"
     PORTFOLIO_CAP_EXCEEDED = "portfolio_cap_exceeded"
+    TOTAL_RESERVED_CAP_EXCEEDED = "total_reserved_cap_exceeded"
     TOKEN_SIDE_CAP_EXCEEDED = "token_side_cap_exceeded"
     WINDOW_CAP_EXCEEDED = "window_cap_exceeded"
     REGION_CAP_EXCEEDED = "region_cap_exceeded"
@@ -88,6 +110,16 @@ class SkipReason(str, Enum):
     SETTLEMENT_SOURCE_CAP_EXCEEDED = "settlement_source_cap_exceeded"
     PRIMARY_CITY_DATE_EXPOSURE_EXISTS = "primary_city_date_exposure_exists"
     REQUESTED_NOTIONAL_BELOW_MINIMUM = "requested_notional_below_minimum"
+    MISSING_VENUE_METADATA = "missing_venue_metadata"
+    INVALID_VENUE_METADATA = "invalid_venue_metadata"
+    ORDER_PRICE_OFF_TICK = "order_price_off_tick"
+    VENUE_NOTIONAL_CAP_EXCEEDED = "venue_notional_cap_exceeded"
+    VENUE_MAXIMUM_LOSS_CAP_EXCEEDED = "venue_maximum_loss_cap_exceeded"
+    UNVERIFIED_VENUE_MINIMUM_SIZE_SEMANTICS = "unverified_venue_minimum_size_semantics"
+    FAK_PARTIAL_EXECUTION_UNIMPLEMENTED = "fak_partial_execution_unimplemented"
+    NOT_IN_FROZEN_DECISIVE_CANDIDATE_SET = (
+        "not_in_frozen_decisive_candidate_set"
+    )
     LEAKAGE_VIOLATION = "leakage_violation"
     STRATEGY_NO_ACTION = "strategy_no_action"
 
@@ -123,6 +155,11 @@ class QuoteSnapshot:
     source_payload_id: Optional[str]
     source_cache_path: Optional[str]
     data_quality_flags: tuple[str, ...] = ()
+    ask_levels: tuple[Mapping[str, float], ...] = ()
+    full_book_complete: Optional[bool] = None
+    direct_polymarket_resting_ask_provenance: bool = False
+    raw_compact_decision_passthrough_verified: bool = False
+    price_transformation_applied: Optional[bool] = None
 
     @property
     def has_executable_bid_ask(self) -> bool:
@@ -900,6 +937,7 @@ class DecisionSnapshot:
     realized_temperature_2m_max_f: Optional[float] = None
     resolved_outcome: Optional[int] = None
     settlement_source: Optional[str] = None
+    venue_execution_constraints: Optional[VenueExecutionConstraints] = None
 
     @classmethod
     def from_sqlite_row(cls, row: Mapping[str, Any]) -> "DecisionSnapshot":
@@ -919,6 +957,35 @@ class DecisionSnapshot:
                 source_payload_id=row.get("quote_source_payload_id"),
                 source_cache_path=row.get("quote_source_cache_path"),
                 data_quality_flags=_json_flags(row.get("quote_data_quality_flags")),
+                ask_levels=_json_book_levels(row.get("ask_levels_json")),
+                full_book_complete=_optional_bool(row.get("full_book_complete")),
+                direct_polymarket_resting_ask_provenance=_boolish(
+                    _first_present_row_value(
+                        row,
+                        (
+                            "quote_direct_polymarket_resting_ask_provenance",
+                            "direct_polymarket_resting_ask_provenance",
+                        ),
+                    )
+                ),
+                raw_compact_decision_passthrough_verified=_boolish(
+                    _first_present_row_value(
+                        row,
+                        (
+                            "quote_raw_compact_decision_passthrough_verified",
+                            "raw_compact_decision_passthrough_verified",
+                        ),
+                    )
+                ),
+                price_transformation_applied=_optional_bool(
+                    _first_present_row_value(
+                        row,
+                        (
+                            "quote_price_transformation_applied",
+                            "price_transformation_applied",
+                        ),
+                    )
+                ),
             )
 
         forecast_run_time = _parse_utc(row.get("forecast_run_time_utc"))
@@ -981,6 +1048,7 @@ class DecisionSnapshot:
             realized_temperature_2m_max_f=_optional_float(row.get("realized_temperature_2m_max_f")),
             resolved_outcome=_optional_int(row.get("resolved_outcome")),
             settlement_source=row.get("settlement_source"),
+            venue_execution_constraints=_venue_constraints_from_row(row),
         )
 
 
@@ -1007,6 +1075,7 @@ class StrategyInput:
     quote: QuoteSnapshot
     forecast: ForecastSnapshot
     score: Optional[SharedScoreContract] = None
+    venue_execution_constraints: Optional[VenueExecutionConstraints] = None
 
 
 @dataclass(frozen=True)
@@ -1019,6 +1088,7 @@ class OrderIntent:
     requested_notional_usd: Optional[float] = None
     requested_shares: Optional[float] = None
     limit_price: Optional[float] = None
+    order_type: str = "UNSPECIFIED"
     reason: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -1410,6 +1480,7 @@ class ReplayFrame:
             quote=self.decision.quote,
             forecast=self.decision.forecast,
             score=self.score,
+            venue_execution_constraints=self.decision.venue_execution_constraints,
         )
 
 
@@ -1516,7 +1587,7 @@ class DefaultLeakageValidator:
 
 @dataclass(frozen=True)
 class PointInTimePolicy:
-    max_quote_staleness_seconds: int = 90 * 60
+    max_quote_staleness_seconds: int = DEFAULT_MAX_REPLAY_QUOTE_AGE_SECONDS
     require_quote: bool = True
     require_forecast: bool = True
     require_canonical_label: bool = True
@@ -1805,6 +1876,7 @@ def _agreement_minimum(
 @dataclass(frozen=True)
 class PortfolioCaps:
     bankroll_usd: float
+    total_reserved_bankroll_fraction: float = 1.0
     window_bankroll_fraction: float = 0.25
     per_position_window_fraction: float = 0.25
     per_city_date_total_fraction: float = 0.15
@@ -1816,6 +1888,10 @@ class PortfolioCaps:
     @property
     def window_cap_usd(self) -> float:
         return self.bankroll_usd * self.window_bankroll_fraction
+
+    @property
+    def total_reserved_cap_usd(self) -> float:
+        return self.bankroll_usd * self.total_reserved_bankroll_fraction
 
     @property
     def per_position_cap_usd(self) -> float:
@@ -1878,6 +1954,7 @@ class PortfolioCapValidator:
     ) -> PortfolioCapResult:
         all_exposures = list(existing) + [proposed]
         reasons: list[SkipReason] = []
+        total_reserved = sum(item.notional_usd for item in all_exposures)
         by_window = _sum_by(all_exposures, lambda item: str(item.decision_hour_utc))
         by_region = _sum_by(all_exposures, lambda item: item.region)
         by_city_date = _sum_by(all_exposures, lambda item: item.city_date_key)
@@ -1892,6 +1969,8 @@ class PortfolioCapValidator:
 
         if proposed.notional_usd > self.caps.per_position_cap_usd:
             reasons.append(SkipReason.PORTFOLIO_CAP_EXCEEDED)
+        if total_reserved > self.caps.total_reserved_cap_usd:
+            reasons.append(SkipReason.TOTAL_RESERVED_CAP_EXCEEDED)
         if by_window[str(proposed.decision_hour_utc)] > self.caps.window_cap_usd:
             reasons.append(SkipReason.WINDOW_CAP_EXCEEDED)
         if by_region[proposed.region] > self.caps.region_cap_usd:
@@ -1909,6 +1988,16 @@ class PortfolioCapValidator:
             passed=not reasons,
             skip_reasons=tuple(dict.fromkeys(reasons)),
             exposures_after={
+                "total_reserved_usd": total_reserved,
+                "allocated_cash_unreserved_usd": (
+                    self.caps.bankroll_usd - total_reserved
+                ),
+                "reservation_capacity_remaining_usd": (
+                    self.caps.total_reserved_cap_usd - total_reserved
+                ),
+                # Historical name retained for report compatibility. This is
+                # reservation-cap headroom, not total allocated cash.
+                "available_cash_usd": self.caps.total_reserved_cap_usd - total_reserved,
                 "window_usd": by_window[str(proposed.decision_hour_utc)],
                 "region_usd": by_region[proposed.region],
                 "city_date_usd": by_city_date[proposed.city_date_key],
@@ -1923,15 +2012,76 @@ class PortfolioState:
         self.caps = caps
         self.validator = PortfolioCapValidator(caps)
         self.exposures: list[ExposureIntent] = []
+        self.peak_concurrent_reserved_capital_usd = 0.0
+        self.peak_cash_usage_usd = 0.0
+        self.minimum_cash_balance_usd = self.caps.total_reserved_cap_usd
+        self.minimum_allocated_cash_unreserved_usd = self.caps.bankroll_usd
+        self.rejected_orders_by_cap_reason: Counter[str] = Counter()
+        self.insolvency_attempts = 0
+        self.reserve_attempts = 0
+        self.accepted_reservations = 0
+        self.committed_reservations = 0
+        self.no_fill_reservations_not_committed = 0
+        self.released_reservations = 0
 
     def check(self, proposed: ExposureIntent) -> PortfolioCapResult:
         return self.validator.validate(self.exposures, proposed)
 
-    def reserve(self, proposed: ExposureIntent) -> PortfolioCapResult:
+    def evaluate_reservation(self, proposed: ExposureIntent) -> PortfolioCapResult:
+        """Evaluate and account for a cap attempt without reserving cash."""
+
+        self.reserve_attempts += 1
         result = self.check(proposed)
         if result.passed:
-            self.exposures.append(proposed)
+            self.accepted_reservations += 1
+        else:
+            self._record_rejection(result)
         return result
+
+    def commit_reservation(
+        self,
+        proposed: ExposureIntent,
+        evaluated_result: PortfolioCapResult,
+    ) -> None:
+        """Commit exposure only after a previously cap-approved fill exists."""
+
+        if not evaluated_result.passed:
+            raise ValueError("cannot commit a cap-rejected reservation")
+        self.exposures.append(proposed)
+        self.committed_reservations += 1
+        self._record_current_cash_state()
+
+    def record_no_fill_not_committed(
+        self,
+        evaluated_result: PortfolioCapResult,
+    ) -> None:
+        if not evaluated_result.passed:
+            raise ValueError("cap-rejected reservations are not no-fill approvals")
+        self.no_fill_reservations_not_committed += 1
+
+    def reserve(self, proposed: ExposureIntent) -> PortfolioCapResult:
+        """Backward-compatible one-step cap evaluation and reservation."""
+
+        result = self.evaluate_reservation(proposed)
+        if result.passed:
+            self.commit_reservation(proposed, result)
+        return result
+
+    def _record_rejection(self, result: PortfolioCapResult) -> None:
+        for reason in result.skip_reasons:
+            self.rejected_orders_by_cap_reason[reason.value] += 1
+        # Exceeding a deliberately conservative reservation cap is not an
+        # insolvency attempt while allocated bankroll would still remain.
+        allocated_cash_after = result.exposures_after.get(
+            "allocated_cash_unreserved_usd"
+        )
+        if allocated_cash_after is None:
+            allocated_cash_after = result.exposures_after.get(
+                "available_cash_usd",
+                0.0,
+            )
+        if allocated_cash_after < -1e-9:
+            self.insolvency_attempts += 1
 
     def release_expired(self, as_of_utc: datetime) -> int:
         as_of = _ensure_utc(as_of_utc)
@@ -1942,14 +2092,63 @@ class PortfolioState:
             if exposure.release_time_utc is None
             or _ensure_utc(exposure.release_time_utc) > as_of
         ]
-        return before - len(self.exposures)
+        released = before - len(self.exposures)
+        self.released_reservations += released
+        return released
+
+    def reserved_notional_usd(self) -> float:
+        return sum(item.notional_usd for item in self.exposures)
+
+    def cash_available_usd(self) -> float:
+        return self.caps.total_reserved_cap_usd - self.reserved_notional_usd()
+
+    def _record_current_cash_state(self) -> None:
+        reserved = self.reserved_notional_usd()
+        self.peak_concurrent_reserved_capital_usd = max(
+            self.peak_concurrent_reserved_capital_usd,
+            reserved,
+        )
+        self.peak_cash_usage_usd = max(self.peak_cash_usage_usd, reserved)
+        self.minimum_cash_balance_usd = min(
+            self.minimum_cash_balance_usd,
+            self.caps.total_reserved_cap_usd - reserved,
+        )
+        self.minimum_allocated_cash_unreserved_usd = min(
+            self.minimum_allocated_cash_unreserved_usd,
+            self.caps.bankroll_usd - reserved,
+        )
 
     def summary(self) -> Mapping[str, Any]:
+        reserved_notional = self.reserved_notional_usd()
         return {
             "reserved_exposure_count": len(self.exposures),
-            "reserved_notional_usd": sum(item.notional_usd for item in self.exposures),
+            "reserved_notional_usd": reserved_notional,
+            "allocated_bankroll_usd": self.caps.bankroll_usd,
+            "allocated_cash_unreserved_usd": (
+                self.caps.bankroll_usd - reserved_notional
+            ),
+            "reservation_capacity_remaining_usd": (
+                self.caps.total_reserved_cap_usd - reserved_notional
+            ),
+            # Historical field retained for report compatibility. It denotes
+            # reservation-cap headroom rather than total allocated cash.
+            "cash_available_usd": self.caps.total_reserved_cap_usd - reserved_notional,
+            "reserve_attempts": self.reserve_attempts,
+            "accepted_reservations": self.accepted_reservations,
+            "committed_reservations": self.committed_reservations,
+            "no_fill_reservations_not_committed": self.no_fill_reservations_not_committed,
+            "released_reservations": self.released_reservations,
+            "peak_concurrent_reserved_capital_usd": self.peak_concurrent_reserved_capital_usd,
+            "peak_cash_usage_usd": self.peak_cash_usage_usd,
+            "minimum_cash_balance_usd": self.minimum_cash_balance_usd,
+            "minimum_allocated_cash_unreserved_usd": (
+                self.minimum_allocated_cash_unreserved_usd
+            ),
+            "rejected_orders_by_cap_reason": dict(sorted(self.rejected_orders_by_cap_reason.items())),
+            "insolvency_attempts": self.insolvency_attempts,
             "cap_dimensions": PORTFOLIO_CAP_SCHEMA["cap_dimensions"],
             "cap_values_usd": {
+                "total_reserved": self.caps.total_reserved_cap_usd,
                 "utc_window": self.caps.window_cap_usd,
                 "per_position": self.caps.per_position_cap_usd,
                 "city_date": self.caps.city_date_cap_usd,
@@ -2005,9 +2204,16 @@ class DictScoreStore:
 
 
 class SQLiteDecisionArtifactLoader:
-    def __init__(self, decision_db: Path, *, use_current_scope: bool = True) -> None:
-        self.decision_db = Path(decision_db)
+    def __init__(
+        self,
+        decision_db: Path,
+        *,
+        use_current_scope: bool = True,
+        immutable: bool = False,
+    ) -> None:
+        self.decision_db = Path(decision_db).expanduser().resolve()
         self.use_current_scope = use_current_scope
+        self.immutable = bool(immutable)
 
     def iter_decisions(
         self,
@@ -2018,7 +2224,10 @@ class SQLiteDecisionArtifactLoader:
     ) -> Iterator[DecisionSnapshot]:
         if not self.decision_db.exists():
             raise FileNotFoundError(self.decision_db)
-        with sqlite3.connect(f"file:{self.decision_db}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(
+            _sqlite_read_only_uri(self.decision_db, immutable=self.immutable),
+            uri=True,
+        ) as conn:
             conn.row_factory = sqlite3.Row
             relation = "decision_snapshots_current" if self.use_current_scope else "decision_snapshots"
             if not _sqlite_relation_exists(conn, relation):
@@ -2051,12 +2260,14 @@ class SQLiteDecisionFrameLoader:
         official_trading_replay_only: bool = False,
         require_compact_quote_store: bool = True,
         point_in_time_policy: PointInTimePolicy = PointInTimePolicy(),
+        immutable: bool = False,
     ) -> None:
-        self.decision_db = Path(decision_db)
+        self.decision_db = Path(decision_db).expanduser().resolve()
         self.relation = relation
         self.official_trading_replay_only = official_trading_replay_only
         self.require_compact_quote_store = require_compact_quote_store
         self.point_in_time_policy = point_in_time_policy
+        self.immutable = bool(immutable)
 
     def iter_frames(
         self,
@@ -2067,7 +2278,10 @@ class SQLiteDecisionFrameLoader:
     ) -> Iterator[ReplayFrame]:
         if not self.decision_db.exists():
             raise FileNotFoundError(self.decision_db)
-        with sqlite3.connect(f"file:{self.decision_db}?mode=ro", uri=True) as conn:
+        with sqlite3.connect(
+            _sqlite_read_only_uri(self.decision_db, immutable=self.immutable),
+            uri=True,
+        ) as conn:
             conn.row_factory = sqlite3.Row
             if not _sqlite_relation_exists(conn, self.relation):
                 raise RuntimeError(f"Missing decision artifact relation: {self.relation}")
@@ -2123,16 +2337,28 @@ class SQLiteDecisionFrameLoader:
 class CompactQuoteHistoryLookup:
     """Read-only compact quote lookup used for execution-realism stress tests."""
 
-    def __init__(self, compact_price_db: Path) -> None:
-        self.compact_price_db = Path(compact_price_db)
+    def __init__(self, compact_price_db: Path, *, immutable: bool = False) -> None:
+        self.compact_price_db = Path(compact_price_db).expanduser().resolve()
+        self.immutable = bool(immutable)
         if not self.compact_price_db.exists():
             raise FileNotFoundError(self.compact_price_db)
-        self._conn = sqlite3.connect(f"file:{self.compact_price_db}?mode=ro", uri=True)
+        self._conn = sqlite3.connect(
+            _sqlite_read_only_uri(self.compact_price_db, immutable=self.immutable),
+            uri=True,
+        )
         self._conn.row_factory = sqlite3.Row
 
     @classmethod
-    def from_work_root(cls, work_root: Path) -> "CompactQuoteHistoryLookup":
-        return cls(Path(work_root).resolve() / COMPACT_PRICE_DB_RELATIVE_PATH)
+    def from_work_root(
+        cls,
+        work_root: Path,
+        *,
+        immutable: bool = False,
+    ) -> "CompactQuoteHistoryLookup":
+        return cls(
+            Path(work_root).resolve() / COMPACT_PRICE_DB_RELATIVE_PATH,
+            immutable=immutable,
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -2148,7 +2374,7 @@ class CompactQuoteHistoryLookup:
         *,
         token_id: str,
         earliest_time_utc: datetime,
-        max_wait_seconds: int = 90 * 60,
+        max_wait_seconds: int = DEFAULT_DELAYED_QUOTE_MAX_WAIT_SECONDS,
     ) -> Optional[QuoteSnapshot]:
         if not token_id:
             return None
@@ -2620,6 +2846,11 @@ class FillPolicy:
     allow_partial: bool = False
     min_fill_shares: float = 0.0
     policy_name: str = "no_partial_fill_visible_size_must_cover_order"
+    enforce_venue_constraints: bool = False
+    max_order_notional_usd: Optional[float] = None
+    max_order_loss_usd: Optional[float] = None
+    require_full_book_execution: bool = False
+    allow_historical_resting_ask_tick_policy: bool = False
 
 
 @dataclass(frozen=True)
@@ -2631,6 +2862,8 @@ class FillResult:
     filled_shares: float = 0.0
     visible_size: Optional[float] = None
     price_source: Optional[str] = None
+    venue_execution_assessment: Optional[Mapping[str, Any]] = None
+    economic_sensitivity_assessment: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -2994,6 +3227,28 @@ class CandidateReplayReportBuilder:
                 "entry_policy": "baseline_order_intents_only_when_runner_score_and_gates_pass",
                 "exit_policy": "exit_hold_primitives_available_no_economic_exit_replay_in_report",
                 "partial_fill_policy": self.fill_policy.policy_name,
+                "venue_constraints_enforced": self.fill_policy.enforce_venue_constraints,
+                "full_order_book_execution_required": (
+                    self.fill_policy.require_full_book_execution
+                ),
+                "historical_resting_ask_tick_policy_enabled": (
+                    self.fill_policy.allow_historical_resting_ask_tick_policy
+                ),
+                "historical_resting_ask_tick_policy_basis": (
+                    HISTORICAL_RESTING_ASK_TICK_BASIS
+                    if self.fill_policy.allow_historical_resting_ask_tick_policy
+                    else None
+                ),
+                "historical_resting_ask_tick_policy_scope": (
+                    "historical_replay_only_never_live_pretrade"
+                ),
+                "max_order_notional_usd": self.fill_policy.max_order_notional_usd,
+                "max_order_loss_usd": self.fill_policy.max_order_loss_usd,
+                "full_book_rule": (
+                    "captured best ask may prove the entire dollar FOK; complete ask levels required only when top capacity is insufficient"
+                    if self.fill_policy.require_full_book_execution
+                    else "historical default; full-book enforcement not requested"
+                ),
                 "orders_executed": self.execution_enabled,
                 "fee_model": self.fee_config.as_report_dict(),
                 "fees_included_in_cash_cost_pnl_roi": True,
@@ -3334,12 +3589,23 @@ class ThroughputDiagnosticVariantState:
             "loosened_dimensions": list(self.spec.loosened_dimensions),
             "config": dict(self.spec.config.as_report_dict()),
             "portfolio_caps": _portfolio_caps_summary(self.spec.portfolio_caps),
+            "fill_policy": {
+                "policy_name": self.fill_policy.policy_name,
+                "enforce_venue_constraints": self.fill_policy.enforce_venue_constraints,
+                "require_full_book_execution": (
+                    self.fill_policy.require_full_book_execution
+                ),
+                "allow_historical_resting_ask_tick_policy": (
+                    self.fill_policy.allow_historical_resting_ask_tick_policy
+                ),
+            },
             "pre_cap_candidate_rows": self.pre_cap_candidate_rows,
             "order_intents": len(self.order_intents),
             "fills": self.fill_count,
             "settlements": len(self.ledger.settlements),
             "unresolved_fills": self.unresolved_fills,
             "cap_block_counts": dict(sorted(self.cap_block_counts.items())),
+            "portfolio_state": self.portfolio_state.summary(),
             "strategy_skip_counts_top": dict(self.strategy_skip_counts.most_common(20)),
             "accounting": accounting,
             "coverage": _throughput_coverage_report(self.coverage, self.coverage_pnl),
@@ -3362,6 +3628,8 @@ class ThroughputDiagnosticVariantState:
 def _portfolio_caps_summary(caps: PortfolioCaps) -> Mapping[str, Any]:
     return {
         "bankroll_usd": caps.bankroll_usd,
+        "total_reserved_bankroll_fraction": caps.total_reserved_bankroll_fraction,
+        "total_reserved_cap_usd": caps.total_reserved_cap_usd,
         "window_bankroll_fraction": caps.window_bankroll_fraction,
         "per_position_window_fraction": caps.per_position_window_fraction,
         "per_city_date_total_fraction": caps.per_city_date_total_fraction,
@@ -3771,12 +4039,44 @@ def _score_frame_for_throughput(
     score_cache: ReplayGeneratedScoreCache,
     point_policy: PointInTimePolicy,
 ) -> tuple[ReplayFrame, bool, bool, bool]:
+    def merged_skip_reasons(
+        score: Optional[SharedScoreContract],
+    ) -> tuple[SkipReason, ...]:
+        inherited_reasons = frame.skip_reasons
+        if score is not None:
+            # Loader policy evaluates the source frame before an on-demand model
+            # score exists. A successfully generated/reused score must clear
+            # only stale score-dependent reasons; unrelated safety and lineage
+            # skips remain fail-closed.
+            inherited_reasons = tuple(
+                reason
+                for reason in inherited_reasons
+                if reason
+                not in {
+                    SkipReason.MISSING_SHARED_SCORE,
+                    SkipReason.INVALID_SHARED_SCORE,
+                    SkipReason.MISSING_MODEL_OUTPUT,
+                }
+            )
+        return tuple(
+            dict.fromkeys(
+                (
+                    *inherited_reasons,
+                    *point_policy.skip_reasons(
+                        frame.decision,
+                        frame.canonical_label,
+                        score,
+                    ),
+                )
+            )
+        )
+
     if frame.score is not None:
         scored = ReplayFrame(
             decision=frame.decision,
             canonical_label=frame.canonical_label,
             score=frame.score,
-            skip_reasons=point_policy.skip_reasons(frame.decision, frame.canonical_label, frame.score),
+            skip_reasons=merged_skip_reasons(frame.score),
         )
         return scored, False, False, False
     if model_runner is None:
@@ -3784,7 +4084,7 @@ def _score_frame_for_throughput(
             decision=frame.decision,
             canonical_label=frame.canonical_label,
             score=None,
-            skip_reasons=point_policy.skip_reasons(frame.decision, frame.canonical_label, None),
+            skip_reasons=merged_skip_reasons(None),
         )
         return scored, False, True, False
     try:
@@ -3792,7 +4092,7 @@ def _score_frame_for_throughput(
         validate_weather_model_context_firewall(context)
         prediction = model_runner.predict(context)
     except ValueError:
-        reasons = list(point_policy.skip_reasons(frame.decision, frame.canonical_label, None))
+        reasons = list(merged_skip_reasons(None))
         reasons.append(SkipReason.MODEL_INPUT_FIREWALL_VIOLATION)
         return (
             ReplayFrame(
@@ -3806,7 +4106,7 @@ def _score_frame_for_throughput(
             True,
         )
     if prediction is None:
-        reasons = list(point_policy.skip_reasons(frame.decision, frame.canonical_label, None))
+        reasons = list(merged_skip_reasons(None))
         reasons.append(SkipReason.MISSING_MODEL_OUTPUT)
         return (
             ReplayFrame(
@@ -3832,7 +4132,7 @@ def _score_frame_for_throughput(
             decision=frame.decision,
             canonical_label=frame.canonical_label,
             score=score,
-            skip_reasons=point_policy.skip_reasons(frame.decision, frame.canonical_label, score),
+            skip_reasons=merged_skip_reasons(score),
         ),
         True,
         False,
@@ -4084,11 +4384,15 @@ class Gen2ValidationVariantState:
 
     def __post_init__(self) -> None:
         self.portfolio_state = PortfolioState(self.spec.portfolio_caps)
+        self.delayed_portfolio_state = PortfolioState(self.spec.portfolio_caps)
+        self.worse_fill_portfolio_state = PortfolioState(self.spec.portfolio_caps)
         self.ledger = self._new_ledger()
         self.delayed_ledger = self._new_ledger()
         self.worse_fill_ledger = self._new_ledger()
         self.pre_cap_candidate_rows = 0
         self.order_intents: list[OrderIntent] = []
+        self.delayed_order_intents: list[OrderIntent] = []
+        self.worse_fill_order_intents: list[OrderIntent] = []
         self.trade_records: list[TradeAccountingRecord] = []
         self.delayed_trade_records: list[TradeAccountingRecord] = []
         self.worse_fill_trade_records: list[TradeAccountingRecord] = []
@@ -4097,6 +4401,8 @@ class Gen2ValidationVariantState:
         self.worse_fill_status_counts: Counter[str] = Counter()
         self.strategy_skip_counts: Counter[str] = Counter()
         self.cap_block_counts: Counter[str] = Counter()
+        self.delayed_cap_block_counts: Counter[str] = Counter()
+        self.worse_fill_cap_block_counts: Counter[str] = Counter()
         self.unresolved_fills = 0
 
     def _new_ledger(self) -> ReplayLedger:
@@ -4115,6 +4421,7 @@ class Gen2ValidationVariantState:
         *,
         delayed_quote_lookup: Optional[CompactQuoteHistoryLookup],
         delay_seconds: int,
+        delayed_quote_max_wait_seconds: int = DEFAULT_DELAYED_QUOTE_MAX_WAIT_SECONDS,
         worse_fill_tick: float,
     ) -> None:
         if frame.skip_reasons:
@@ -4126,40 +4433,56 @@ class Gen2ValidationVariantState:
             for reason in _metadata_skip_reasons(decision.metadata):
                 self.strategy_skip_counts[reason.value] += 1
             return
-        for order in decision.orders:
+        for candidate_order in decision.orders:
+            order = (
+                replace(candidate_order, order_type="FOK")
+                if self.fill_policy.require_full_book_execution
+                and str(candidate_order.order_type or "").upper()
+                in {"", "UNSPECIFIED"}
+                else candidate_order
+            )
             self.pre_cap_candidate_rows += 1
             self.portfolio_state.release_expired(frame.decision.decision_time_utc)
             exposure = _exposure_intent_from_order(order, frame.decision)
-            cap_result = self.portfolio_state.reserve(exposure)
+            cap_result = self.portfolio_state.evaluate_reservation(exposure)
             if not cap_result.passed:
                 for reason in cap_result.skip_reasons:
                     self.cap_block_counts[reason.value] += 1
-                continue
-            self.order_intents.append(order)
-            base_fill_result = simulate_order_fill(
-                order,
-                frame.decision,
-                fill_policy=self.fill_policy,
-                fee_config=self.fee_config,
-            )
-            self._apply_fill_result(
-                frame=frame,
-                order=order,
-                fill_result=base_fill_result,
-                ledger=self.ledger,
-                records=self.trade_records,
-                fill_status_counts=self.fill_status_counts,
-            )
+            else:
+                self.order_intents.append(order)
+                base_fill_result = simulate_order_fill(
+                    order,
+                    frame.decision,
+                    fill_policy=self.fill_policy,
+                    fee_config=self.fee_config,
+                )
+                self._commit_fill_or_record_no_fill(
+                    portfolio_state=self.portfolio_state,
+                    exposure=exposure,
+                    cap_result=cap_result,
+                    fill_result=base_fill_result,
+                )
+                self._apply_fill_result(
+                    frame=frame,
+                    order=order,
+                    fill_result=base_fill_result,
+                    ledger=self.ledger,
+                    records=self.trade_records,
+                    fill_status_counts=self.fill_status_counts,
+                )
             self._run_worse_fill_stress(
                 frame=frame,
                 order=order,
+                exposure=exposure,
                 worse_fill_tick=worse_fill_tick,
             )
             self._run_delayed_entry_stress(
                 frame=frame,
                 order=order,
+                exposure=exposure,
                 delayed_quote_lookup=delayed_quote_lookup,
                 delay_seconds=delay_seconds,
+                delayed_quote_max_wait_seconds=delayed_quote_max_wait_seconds,
             )
 
     def _run_worse_fill_stress(
@@ -4167,27 +4490,40 @@ class Gen2ValidationVariantState:
         *,
         frame: ReplayFrame,
         order: OrderIntent,
+        exposure: ExposureIntent,
         worse_fill_tick: float,
     ) -> None:
-        quote = frame.decision.quote
-        if quote is None:
-            self.worse_fill_status_counts["missing_quote"] += 1
-            return
-        stress_quote = _quote_with_worse_fill_tick(
-            quote,
-            action=order.action,
-            tick=worse_fill_tick,
+        self.worse_fill_portfolio_state.release_expired(
+            frame.decision.decision_time_utc
         )
-        stress_decision = replace(frame.decision, quote=stress_quote)
-        stress_frame = replace(frame, decision=stress_decision)
-        fill_result = simulate_order_fill(
+        cap_result = self.worse_fill_portfolio_state.evaluate_reservation(exposure)
+        if not cap_result.passed:
+            for reason in cap_result.skip_reasons:
+                self.worse_fill_cap_block_counts[reason.value] += 1
+            return
+        self.worse_fill_order_intents.append(order)
+        base_fill_result = simulate_order_fill(
             order,
-            stress_decision,
+            frame.decision,
             fill_policy=self.fill_policy,
             fee_config=self.fee_config,
         )
+        fill_result = simulate_fixed_worse_price_economic_sensitivity(
+            order,
+            frame.decision,
+            price_delta_usd=worse_fill_tick,
+            fill_policy=self.fill_policy,
+            fee_config=self.fee_config,
+            base_fill_result=base_fill_result,
+        )
+        self._commit_fill_or_record_no_fill(
+            portfolio_state=self.worse_fill_portfolio_state,
+            exposure=exposure,
+            cap_result=cap_result,
+            fill_result=fill_result,
+        )
         self._apply_fill_result(
-            frame=stress_frame,
+            frame=frame,
             order=order,
             fill_result=fill_result,
             ledger=self.worse_fill_ledger,
@@ -4200,8 +4536,10 @@ class Gen2ValidationVariantState:
         *,
         frame: ReplayFrame,
         order: OrderIntent,
+        exposure: ExposureIntent,
         delayed_quote_lookup: Optional[CompactQuoteHistoryLookup],
         delay_seconds: int,
+        delayed_quote_max_wait_seconds: int,
     ) -> None:
         if delayed_quote_lookup is None:
             self.delayed_fill_status_counts["delayed_lookup_unavailable"] += 1
@@ -4210,10 +4548,18 @@ class Gen2ValidationVariantState:
         delayed_quote = delayed_quote_lookup.quote_after(
             token_id=order.token_id,
             earliest_time_utc=earliest,
+            max_wait_seconds=delayed_quote_max_wait_seconds,
         )
         if delayed_quote is None:
             self.delayed_fill_status_counts["missing_delayed_quote"] += 1
             return
+        self.delayed_portfolio_state.release_expired(delayed_quote.timestamp_utc)
+        cap_result = self.delayed_portfolio_state.evaluate_reservation(exposure)
+        if not cap_result.passed:
+            for reason in cap_result.skip_reasons:
+                self.delayed_cap_block_counts[reason.value] += 1
+            return
+        self.delayed_order_intents.append(order)
         stress_decision = replace(frame.decision, quote=delayed_quote)
         stress_frame = replace(frame, decision=stress_decision)
         fill_result = simulate_order_fill(
@@ -4223,6 +4569,12 @@ class Gen2ValidationVariantState:
             fee_config=self.fee_config,
             fill_timestamp_utc=delayed_quote.timestamp_utc,
         )
+        self._commit_fill_or_record_no_fill(
+            portfolio_state=self.delayed_portfolio_state,
+            exposure=exposure,
+            cap_result=cap_result,
+            fill_result=fill_result,
+        )
         self._apply_fill_result(
             frame=stress_frame,
             order=order,
@@ -4231,6 +4583,19 @@ class Gen2ValidationVariantState:
             records=self.delayed_trade_records,
             fill_status_counts=self.delayed_fill_status_counts,
         )
+
+    @staticmethod
+    def _commit_fill_or_record_no_fill(
+        *,
+        portfolio_state: PortfolioState,
+        exposure: ExposureIntent,
+        cap_result: PortfolioCapResult,
+        fill_result: FillResult,
+    ) -> None:
+        if fill_result.fill is None:
+            portfolio_state.record_no_fill_not_committed(cap_result)
+            return
+        portfolio_state.commit_reservation(exposure, cap_result)
 
     def _apply_fill_result(
         self,
@@ -4277,30 +4642,44 @@ class Gen2ValidationVariantState:
             _fixed_strategy_accounting_report(
                 trade_records=self.delayed_trade_records,
                 fill_status_counts=self.delayed_fill_status_counts,
-                order_intents=self.order_intents,
+                order_intents=self.delayed_order_intents,
                 ledger=self.delayed_ledger,
                 starting_cash_usd=self.starting_cash_usd,
                 fee_config=self.fee_config,
             )
         )
-        worse_fill = _compact_accounting_report(
-            _fixed_strategy_accounting_report(
-                trade_records=self.worse_fill_trade_records,
-                fill_status_counts=self.worse_fill_status_counts,
-                order_intents=self.order_intents,
-                ledger=self.worse_fill_ledger,
-                starting_cash_usd=self.starting_cash_usd,
-                fee_config=self.fee_config,
+        worse_fill = dict(
+            _compact_accounting_report(
+                _fixed_strategy_accounting_report(
+                    trade_records=self.worse_fill_trade_records,
+                    fill_status_counts=self.worse_fill_status_counts,
+                    order_intents=self.worse_fill_order_intents,
+                    ledger=self.worse_fill_ledger,
+                    starting_cash_usd=self.starting_cash_usd,
+                    fee_config=self.fee_config,
+                )
             )
         )
-        return {"delayed_entry_2s": delayed, "worse_fill_1tick": worse_fill}
+        worse_fill["scenario_contract"] = {
+            "scenario_kind": "economic_counterfactual_after_proven_base_execution",
+            "price_delta_usd": DEFAULT_WORSE_FILL_TICK,
+            "counterfactual_price_venue_validated": False,
+            "counterfactual_price_tick_validated": False,
+            "counterfactual_price_limit_validated": False,
+            "counterfactual_order_submitted_or_reexecuted": False,
+            "base_no_fill_statuses_remain_distinct": True,
+        }
+        return {
+            "delayed_entry_2s": delayed,
+            FIXED_WORSE_PRICE_STRESS_SCENARIO: worse_fill,
+        }
 
     def summary(self) -> Mapping[str, Any]:
         accounting = self.base_accounting()
         stress = self.stress_accounting()
         pnl = accounting.get("pnl", {})
         delayed_pnl = stress["delayed_entry_2s"].get("pnl", {})
-        worse_pnl = stress["worse_fill_1tick"].get("pnl", {})
+        worse_pnl = stress[FIXED_WORSE_PRICE_STRESS_SCENARIO].get("pnl", {})
         return {
             "variant_key": self.spec.key,
             "label": self.spec.label,
@@ -4314,6 +4693,17 @@ class Gen2ValidationVariantState:
             "fills": len(self.ledger.fills),
             "settlements": len(self.ledger.settlements),
             "cap_block_counts": dict(sorted(self.cap_block_counts.items())),
+            "portfolio_state": self.portfolio_state.summary(),
+            "stress_cap_block_counts": {
+                "delayed_entry_2s": dict(sorted(self.delayed_cap_block_counts.items())),
+                FIXED_WORSE_PRICE_STRESS_SCENARIO: dict(
+                    sorted(self.worse_fill_cap_block_counts.items())
+                ),
+            },
+            "stress_portfolio_states": {
+                "delayed_entry_2s": self.delayed_portfolio_state.summary(),
+                FIXED_WORSE_PRICE_STRESS_SCENARIO: self.worse_fill_portfolio_state.summary(),
+            },
             "strategy_skip_counts_top": dict(self.strategy_skip_counts.most_common(20)),
             "base_accounting": accounting,
             "stress_accounting": stress,
@@ -4342,6 +4732,9 @@ class Gen2ValidationVariantState:
                 "total_fees_usd": pnl.get("total_fees_usd"),
                 "delayed_entry_net_pnl_usd": delayed_pnl.get("net_fee_adjusted_realized_pnl_usd"),
                 "worse_fill_net_pnl_usd": worse_pnl.get("net_fee_adjusted_realized_pnl_usd"),
+                "fixed_0_01_economic_sensitivity_net_pnl_usd": worse_pnl.get(
+                    "net_fee_adjusted_realized_pnl_usd"
+                ),
             },
         }
 
@@ -4714,14 +5107,19 @@ def run_old_no_tail_live_forward_shadow_logging(
     leakage_validators: Sequence[LeakageValidator] = (DefaultLeakageValidator(),),
     progress_every: int = 0,
 ) -> Mapping[str, Any]:
+    from .shadow_risk import GuardedDryRunOrderExecutor, LiveSafetyConfig, PortfolioSnapshot
+
     spec = old_no_tail_live_forward_shadow_spec(starting_cash_usd=starting_cash_usd)
     portfolio_state = PortfolioState(spec.portfolio_caps)
+    pre_trade_executor = GuardedDryRunOrderExecutor(config=LiveSafetyConfig())
+    pre_trade_portfolio = PortfolioSnapshot(cash_balance_usd=starting_cash_usd)
     cache = score_cache or ReplayGeneratedScoreCache()
     point_policy = PointInTimePolicy(require_shared_score=True, require_canonical_label=False)
     events: list[Mapping[str, Any]] = []
     frame_skip_counts: Counter[str] = Counter()
     no_trade_reason_counts: Counter[str] = Counter()
     cap_block_counts: Counter[str] = Counter()
+    pre_trade_block_counts: Counter[str] = Counter()
     leakage_violations: Counter[str] = Counter()
     settlement_counts: Counter[str] = Counter()
     market_discovery_counts: Counter[str] = Counter()
@@ -4731,6 +5129,8 @@ def run_old_no_tail_live_forward_shadow_logging(
     missing_model_outputs = 0
     firewall_violations = 0
     would_trade_count = 0
+    pre_trade_checked_count = 0
+    pre_trade_allowed_count = 0
     total_rows = 0
     runner_metadata = dict(model_runner.metadata()) if model_runner is not None else {}
     generated_at = datetime.now(timezone.utc)
@@ -4772,6 +5172,20 @@ def run_old_no_tail_live_forward_shadow_logging(
             portfolio_state=portfolio_state,
             collected_at_utc=generated_at,
         )
+        pre_trade_result = _attach_pre_trade_gate_to_shadow_event(
+            event,
+            executor=pre_trade_executor,
+            portfolio=pre_trade_portfolio,
+            checked_at_utc=generated_at,
+        )
+        if pre_trade_result is not None:
+            event = pre_trade_result["event"]
+            pre_trade_checked_count += 1
+            gate = pre_trade_result["gate"]
+            if gate.get("accepted_by_pre_trade_gate"):
+                pre_trade_allowed_count += 1
+            else:
+                pre_trade_block_counts.update(gate.get("risk_decision", {}).get("block_reasons") or ())
         events.append(event)
         decision = event["decision"]
         settlement_counts[str(event["settlement"].get("status") or "unknown")] += 1
@@ -4826,6 +5240,19 @@ def run_old_no_tail_live_forward_shadow_logging(
         "decision_counts": {
             "would_trade_signals": would_trade_count,
             "no_trade_decisions": total_rows - would_trade_count,
+        },
+        "pre_trade_gate": {
+            "checker": "daily_weather_pipeline.shadow_risk.PreTradeRiskChecker",
+            "guarded_order_path": "daily_weather_pipeline.shadow_risk.GuardedDryRunOrderExecutor.submit_order",
+            "mandatory_before_future_order_adapter": True,
+            "dry_run_only": True,
+            "checked_would_trade_signals": pre_trade_checked_count,
+            "allowed_by_pre_trade_gate": pre_trade_allowed_count,
+            "blocked_by_pre_trade_gate": pre_trade_checked_count - pre_trade_allowed_count,
+            "blocked_reason_counts": dict(sorted(pre_trade_block_counts.items())),
+            "order_submission_code_path_invoked": False,
+            "real_order_placement_allowed": False,
+            "real_orders_placed": 0,
         },
         "frame_skip_counts": dict(sorted(frame_skip_counts.items())),
         "no_trade_reason_counts": dict(sorted(no_trade_reason_counts.items())),
@@ -4904,6 +5331,33 @@ def _old_no_tail_shadow_event(
             "shadow_exposure_after": dict(exposure_after),
         },
         "settlement": _shadow_settlement(frame.canonical_label, order.side if order else decision.side),
+    }
+
+
+def _attach_pre_trade_gate_to_shadow_event(
+    event: Mapping[str, Any],
+    *,
+    executor: Any,
+    portfolio: Any,
+    checked_at_utc: datetime,
+) -> Optional[Mapping[str, Any]]:
+    from .shadow_risk import RuntimeFlags, proposed_order_from_shadow_event
+
+    order = proposed_order_from_shadow_event(event)
+    if order is None:
+        return None
+    result = executor.submit_order(
+        order,
+        portfolio,
+        runtime_flags=RuntimeFlags(dry_run=True),
+        now=checked_at_utc,
+    )
+    return {
+        "event": {
+            **event,
+            "pre_trade_gate": result.as_report_dict(),
+        },
+        "gate": result.as_report_dict(),
     }
 
 
@@ -5177,7 +5631,7 @@ GEN2_STRATEGY_VALIDATION_PASS_CRITERIA: Mapping[str, Any] = {
     },
     "stress_limits": {
         "base_net_pnl_must_be_positive": True,
-        "worse_fill_1tick_net_pnl_must_be_positive": True,
+        "fixed_0_01_worse_price_sensitivity_net_pnl_must_be_positive": True,
         "delayed_entry_2s_net_pnl_must_be_positive": True,
         "delayed_entry_fill_retention_min": 0.90,
     },
@@ -5309,8 +5763,8 @@ def run_gen2_strategy_validation(
                 "market local date plus one day at 12:00 local converted to UTC"
             ),
             "stress_state_reuse": (
-                "base, delayed-entry, and worse-fill scenarios use separate ledgers; "
-                "portfolio caps reserve once per accepted base order intent"
+                "Base, delayed-entry, and fixed-price sensitivity scenarios keep separate "
+                "ledgers and exposure reservations. Terminal no-fills release capacity."
             ),
             "score_cache_role": "audit_cache_only_not_source_of_truth",
         },
@@ -5349,11 +5803,11 @@ def run_gen2_strategy_validation(
                 "delay_seconds": delay_seconds,
                 "lookup": "first compact quote at or after decision_time + delay",
             },
-            "worse_fill_stress": {
+            FIXED_WORSE_PRICE_STRESS_SCENARIO: {
                 "enabled": True,
-                "tick": worse_fill_tick,
-                "buy_orders": "ask increased by one tick",
-                "sell_orders": "bid decreased by one tick",
+                "price_delta_usd": worse_fill_tick,
+                "historical_tick_metadata_used": False,
+                "scenario_kind": "fixed_price_economic_sensitivity_after_base_fill",
             },
             "order_latency_model": "stress_test_only_not_full_latency_execution_model",
         },
@@ -5536,6 +5990,141 @@ def run_gen2_cap_divergence_diagnostic(
     }
 
 
+def run_gen2_variant_solvency_diagnostic(
+    dataset: Any,
+    *,
+    variant_key: str,
+    starting_cash_usd: float = 100.0,
+    limit: int = 0,
+    model_runner: Optional[WeatherModelRunner] = None,
+    score_cache: Optional[ReplayGeneratedScoreCache] = None,
+    leakage_validators: Sequence[LeakageValidator] = (DefaultLeakageValidator(),),
+    fee_config: FeeModelConfig = FeeModelConfig(
+        fee_model=DEFAULT_STRATEGY_REPLAY_FEE_MODEL,
+        fee_rate=DEFAULT_STRATEGY_REPLAY_FEE_RATE,
+    ),
+    progress_every: int = 0,
+) -> Mapping[str, Any]:
+    specs = {spec.key: spec for spec in _gen2_variant_specs(starting_cash_usd)}
+    if variant_key not in specs:
+        raise ValueError(f"Unknown Gen-2 variant key: {variant_key}")
+    spec = specs[variant_key]
+    state = Gen2ValidationVariantState(
+        spec=spec,
+        starting_cash_usd=starting_cash_usd,
+        fee_config=fee_config,
+    )
+    cache = score_cache or ReplayGeneratedScoreCache()
+    point_policy = PointInTimePolicy(require_shared_score=True)
+    runner_metadata = dict(model_runner.metadata()) if model_runner is not None else {}
+    total_rows = 0
+    model_outputs = 0
+    missing_model_outputs = 0
+    firewall_violations = 0
+    leakage_violations: Counter[str] = Counter()
+    frame_skip_counts: Counter[str] = Counter()
+    start_time = time.perf_counter()
+    for source_frame in dataset.iter_frames(limit=limit):
+        total_rows += 1
+        if progress_every and total_rows % progress_every == 0:
+            print(f"gen2-solvency rows={total_rows}", flush=True)
+        frame, generated_score, missing_model, firewall_violation = _score_frame_for_throughput(
+            source_frame,
+            model_runner=model_runner,
+            score_cache=cache,
+            point_policy=point_policy,
+        )
+        if generated_score or frame.score is not None:
+            model_outputs += 1
+        if missing_model:
+            missing_model_outputs += 1
+        if firewall_violation:
+            firewall_violations += 1
+        violations = tuple(
+            violation
+            for validator in leakage_validators
+            for violation in validator.validate(frame)
+        )
+        for violation in violations:
+            leakage_violations[violation.code] += 1
+        if violations:
+            frame = replace(
+                frame,
+                skip_reasons=_frame_skip_reasons_with_leakage(frame.skip_reasons, violations),
+            )
+        if frame.skip_reasons:
+            for reason in frame.skip_reasons:
+                frame_skip_counts[reason.value] += 1
+        state.process_frame(
+            frame,
+            delayed_quote_lookup=None,
+            delay_seconds=DEFAULT_DELAY_STRESS_SECONDS,
+            delayed_quote_max_wait_seconds=DEFAULT_DELAYED_QUOTE_MAX_WAIT_SECONDS,
+            worse_fill_tick=DEFAULT_WORSE_FILL_TICK,
+        )
+    runtime_seconds = time.perf_counter() - start_time
+    summary = state.summary()
+    portfolio = state.portfolio_state.summary()
+    rejected = portfolio.get("rejected_orders_by_cap_reason", {})
+    total_reserved_rejections = int(
+        rejected.get(SkipReason.TOTAL_RESERVED_CAP_EXCEEDED.value, 0)
+    )
+    insolvency_attempts = int(portfolio.get("insolvency_attempts") or 0)
+    minimum_cash_balance = float(portfolio.get("minimum_cash_balance_usd") or 0.0)
+    return {
+        "schema_version": BACKTEST_FRAMEWORK_SCHEMA_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "gen2_single_variant_solvency_diagnostic",
+        "dataset_id": "six_month_v1",
+        "official_trading_replay_sql_predicate": OFFICIAL_TRADING_REPLAY_SQL_PREDICATE,
+        "row_limit": limit,
+        "variant_key": variant_key,
+        "variant_parameters": dict(spec.parameters),
+        "variant_config": dict(spec.config_report),
+        "portfolio_caps": _portfolio_caps_summary(spec.portfolio_caps),
+        "total_rows_scanned": total_rows,
+        "runtime_seconds": runtime_seconds,
+        "rows_per_sec": (total_rows / runtime_seconds) if runtime_seconds else None,
+        "model_outputs_generated_or_present": model_outputs,
+        "missing_model_outputs": missing_model_outputs,
+        "model_input_firewall_violations": firewall_violations,
+        "leakage_validation": {"violation_counts": dict(sorted(leakage_violations.items()))},
+        "frame_skip_counts": dict(sorted(frame_skip_counts.items())),
+        "variant_summary": summary,
+        "solvency": {
+            "accepted_orders_exceeded_bankroll": minimum_cash_balance < -1e-9,
+            "minimum_cash_balance_usd": minimum_cash_balance,
+            "peak_concurrent_reserved_capital_usd": portfolio.get(
+                "peak_concurrent_reserved_capital_usd"
+            ),
+            "peak_cash_usage_usd": portfolio.get("peak_cash_usage_usd"),
+            "rejected_orders_by_cap_reason": rejected,
+            "total_reserved_cap_rejections": total_reserved_rejections,
+            "insolvency_attempts": insolvency_attempts,
+            "verdict": (
+                "accepted_orders_within_bankroll_but_attempts_rejected"
+                if total_reserved_rejections or insolvency_attempts
+                else "accepted_orders_within_bankroll_no_insolvency_attempts"
+            ),
+        },
+        "weather_model_runner": {
+            "metadata": runner_metadata,
+            "fixture_runner_used": runner_metadata.get("fixture_only") == "true",
+            "real_weather_model_runner_plugged_in": (
+                runner_metadata.get("fixture_only") == "false"
+                and bool(runner_metadata)
+            ),
+            "research_only_not_promoted": (
+                runner_metadata.get("promotion_status") == "research_only_not_promoted"
+            ),
+        },
+        "score_cache_role": "audit_cache_only_not_source_of_truth",
+        "no_grid_optimization": True,
+        "single_variant_only": True,
+        "no_live_trading": True,
+    }
+
+
 def _portfolio_cap_result_report(result: PortfolioCapResult) -> Mapping[str, Any]:
     return {
         "passed": result.passed,
@@ -5618,6 +6207,9 @@ def _rank_gen2_variants(
                 "total_fees_usd": metrics.get("total_fees_usd"),
                 "delayed_entry_net_pnl_usd": metrics.get("delayed_entry_net_pnl_usd"),
                 "worse_fill_net_pnl_usd": metrics.get("worse_fill_net_pnl_usd"),
+                "fixed_0_01_economic_sensitivity_net_pnl_usd": metrics.get(
+                    "fixed_0_01_economic_sensitivity_net_pnl_usd"
+                ),
                 "parameters": summary.get("parameters"),
                 "_sort_pnl": pnl,
             }
@@ -5765,7 +6357,7 @@ def _gen2_stress_eval(summary: Mapping[str, Any]) -> Mapping[str, Any]:
     base_fills = int(summary.get("fills") or 0)
     stress = summary.get("stress_accounting", {})
     delayed = stress.get("delayed_entry_2s", {})
-    worse = stress.get("worse_fill_1tick", {})
+    worse = stress.get(FIXED_WORSE_PRICE_STRESS_SCENARIO, {})
     delayed_pnl = _float_or_none(delayed.get("pnl", {}).get("net_fee_adjusted_realized_pnl_usd")) or 0.0
     worse_pnl = _float_or_none(worse.get("pnl", {}).get("net_fee_adjusted_realized_pnl_usd")) or 0.0
     delayed_fills = int(delayed.get("fill_counts", {}).get("actual_fills") or 0)
@@ -6203,6 +6795,7 @@ VALIDATION_ONLY_REPORT_SCHEMA: Mapping[str, Any] = {
 PORTFOLIO_CAP_SCHEMA: Mapping[str, Any] = {
     "schema_version": BACKTEST_FRAMEWORK_SCHEMA_VERSION,
     "cap_dimensions": [
+        "total_reserved_cash",
         "utc_window",
         "region",
         "city_date",
@@ -6211,6 +6804,7 @@ PORTFOLIO_CAP_SCHEMA: Mapping[str, Any] = {
         "settlement_source_family",
     ],
     "default_hypotheses": {
+        "total_reserved_bankroll_fraction": 1.0,
         "window_bankroll_fraction": 0.25,
         "per_position_window_fraction": 0.25,
         "per_city_date_total_fraction": "0.10_to_0.15_strategy_spec_hypothesis",
@@ -6565,8 +7159,15 @@ def write_conservative_fv_edge_throughput_diagnostic_report(
     }
 
 
-def _count_settlement_excluded_quote_rows(decision_db: Path) -> Mapping[str, Any]:
-    with sqlite3.connect(decision_db) as conn:
+def _count_settlement_excluded_quote_rows(
+    decision_db: Path,
+    *,
+    immutable: bool = False,
+) -> Mapping[str, Any]:
+    with sqlite3.connect(
+        _sqlite_read_only_uri(decision_db, immutable=immutable),
+        uri=True,
+    ) as conn:
         if not _sqlite_relation_exists(conn, COMPACT_DECISION_VIEW):
             return {"available": False, "reason": f"{COMPACT_DECISION_VIEW} not found"}
         total_quote_rows = int(
@@ -7434,6 +8035,86 @@ def write_gen2_cap_divergence_report(
     }
 
 
+def write_gen2_variant_solvency_report(
+    *,
+    work_root: Path,
+    output_dir: Path,
+    variant_key: str,
+    limit: int = 0,
+    starting_cash_usd: float = 100.0,
+    weather_runner: str = "observed-high-guarded",
+    source_repo: Optional[Path] = None,
+    progress_every: int = 50000,
+    fee_model: str = DEFAULT_STRATEGY_REPLAY_FEE_MODEL,
+    fee_rate: float = DEFAULT_STRATEGY_REPLAY_FEE_RATE,
+) -> dict[str, Any]:
+    work_root = Path(work_root).resolve()
+    wide_db = work_root / WIDE_PRICE_DB_RELATIVE_PATH
+    if wide_db.exists():
+        raise RuntimeError(f"Wide price DB must remain unused for six_month_v1: {wide_db}")
+    decision_db = work_root / "work" / "data" / "backtest" / "daily_weather_decision_artifact.sqlite"
+    if not decision_db.exists():
+        raise FileNotFoundError(decision_db)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    runner_slug = _weather_runner_slug(weather_runner)
+    score_cache_path = output_dir / (
+        f"{timestamp}-{runner_slug}-gen2-solvency-generated-shared-scores.jsonl.gz"
+    )
+    score_cache = ReplayGeneratedScoreCache(
+        stream_path=score_cache_path,
+        compress=True,
+        keep_records=False,
+    )
+    model_runner = _build_candidate_weather_model_runner(
+        weather_runner,
+        work_root=work_root,
+        source_repo=source_repo,
+    )
+    loader = SQLiteDecisionFrameLoader(
+        decision_db,
+        relation=COMPACT_DECISION_VIEW,
+        official_trading_replay_only=True,
+        require_compact_quote_store=True,
+        point_in_time_policy=PointInTimePolicy(require_shared_score=True),
+    )
+    fee_config = FeeModelConfig(fee_model=fee_model, fee_rate=fee_rate)
+    payload = run_gen2_variant_solvency_diagnostic(
+        loader,
+        variant_key=variant_key,
+        starting_cash_usd=starting_cash_usd,
+        limit=limit,
+        model_runner=model_runner,
+        score_cache=score_cache,
+        fee_config=fee_config,
+        progress_every=progress_every,
+    )
+    score_cache.write_jsonl(score_cache_path)
+    payload = {
+        **payload,
+        "freeze_manifest": str(work_root / SIX_MONTH_V1_FREEZE_MANIFEST),
+        "decision_artifact_db": str(decision_db),
+        "compact_price_db": str(work_root / COMPACT_PRICE_DB_RELATIVE_PATH),
+        "compact_only": True,
+        "wide_price_db_exists": False,
+        "code_hashes": {
+            "backtesting_engine_py_sha256": _file_sha256(Path(__file__)),
+        },
+        "replay_generated_score_cache": score_cache.report_summary(
+            artifact_path=score_cache_path
+        ),
+    }
+    json_path = output_dir / f"{timestamp}-gen2-solvency-report.json"
+    md_path = output_dir / f"{timestamp}-gen2-solvency-report.md"
+    json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    md_path.write_text(_gen2_variant_solvency_markdown(payload), encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(md_path),
+        "score_cache_path": str(score_cache_path),
+    }
+
+
 def write_old_no_tail_live_forward_shadow_report(
     *,
     work_root: Path,
@@ -7592,7 +8273,7 @@ def _write_gen2_strategy_validation_csvs(
         for scenario, records in (
             ("base", state.trade_records),
             ("delayed_entry_2s", state.delayed_trade_records),
-            ("worse_fill_1tick", state.worse_fill_trade_records),
+            (FIXED_WORSE_PRICE_STRESS_SCENARIO, state.worse_fill_trade_records),
         ):
             for record in records:
                 ledger_rows.append(
@@ -7602,6 +8283,26 @@ def _write_gen2_strategy_validation_csvs(
                         "stage": state.spec.stage,
                         "strategy_family": state.spec.strategy_family,
                         "stress_scenario": scenario,
+                        "stress_scenario_kind": (
+                            "economic_counterfactual_after_proven_base_execution"
+                            if scenario == FIXED_WORSE_PRICE_STRESS_SCENARIO
+                            else "execution_replay"
+                        ),
+                        "counterfactual_price_venue_validated": (
+                            False
+                            if scenario == FIXED_WORSE_PRICE_STRESS_SCENARIO
+                            else None
+                        ),
+                        "counterfactual_price_tick_validated": (
+                            False
+                            if scenario == FIXED_WORSE_PRICE_STRESS_SCENARIO
+                            else None
+                        ),
+                        "counterfactual_price_limit_validated": (
+                            False
+                            if scenario == FIXED_WORSE_PRICE_STRESS_SCENARIO
+                            else None
+                        ),
                         **record.to_report_dict(),
                     }
                 )
@@ -7801,6 +8502,8 @@ def _gen2_stable_run_fingerprint(payload: Mapping[str, Any]) -> str:
     score_cache = payload.get("replay_generated_score_cache", {})
     stable = {
         "mode": payload.get("mode"),
+        "execution_profile": payload.get("execution_profile"),
+        "execution_profile_config": payload.get("execution_profile_config"),
         "dataset_id": payload.get("dataset_id"),
         "official_trading_replay_sql_predicate": payload.get("official_trading_replay_sql_predicate"),
         "row_limit": payload.get("row_limit"),
@@ -7937,12 +8640,77 @@ def _gen2_cap_divergence_markdown(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _gen2_variant_solvency_markdown(payload: Mapping[str, Any]) -> str:
+    solvency = payload.get("solvency", {})
+    summary = payload.get("variant_summary", {})
+    portfolio = summary.get("portfolio_state", {})
+    fills = summary.get("base_accounting", {}).get("fill_counts", {})
+    pnl = summary.get("base_accounting", {}).get("pnl", {})
+    score_cache = payload.get("replay_generated_score_cache", {})
+    lines = [
+        "# Gen-2 Single-Variant Solvency Diagnostic",
+        "",
+        "Mode: one frozen variant, bounded row scan, no live trading, no grid optimization.",
+        "",
+        f"Variant: `{payload.get('variant_key')}`",
+        f"Rows scanned: `{payload.get('total_rows_scanned')}`",
+        f"Pre-cap candidates: `{summary.get('pre_cap_candidate_rows')}`",
+        f"Order intents accepted: `{summary.get('order_intents')}`",
+        f"Fills: `{summary.get('fills')}`",
+        f"Settlements: `{summary.get('settlements')}`",
+        f"Score cache artifact: `{score_cache.get('artifact_path')}`",
+        "",
+        "## Solvency",
+        "",
+        f"- Verdict: `{solvency.get('verdict')}`",
+        f"- Accepted orders exceeded bankroll: `{solvency.get('accepted_orders_exceeded_bankroll')}`",
+        f"- Peak concurrent reserved capital: `${solvency.get('peak_concurrent_reserved_capital_usd')}`",
+        f"- Peak cash usage: `${solvency.get('peak_cash_usage_usd')}`",
+        f"- Minimum cash balance: `${solvency.get('minimum_cash_balance_usd')}`",
+        f"- Insolvency attempts: `{solvency.get('insolvency_attempts')}`",
+        f"- Total reserved-cap rejections: `{solvency.get('total_reserved_cap_rejections')}`",
+        f"- Rejected orders by cap reason: `{solvency.get('rejected_orders_by_cap_reason')}`",
+        "",
+        "## Accounting Snapshot",
+        "",
+        f"- Attempted fills: `{fills.get('attempted_fills')}`",
+        f"- Actual fills: `{fills.get('actual_fills')}`",
+        f"- Net fee-adjusted PnL: `${pnl.get('net_fee_adjusted_realized_pnl_usd')}`",
+        f"- ROI after fees: `{pnl.get('roi_after_fees_on_deployed_capital')}`",
+        f"- Win/loss/flat: `{pnl.get('win_count')}` / `{pnl.get('loss_count')}` / `{pnl.get('flat_count')}`",
+        "",
+        "## Portfolio State",
+        "",
+        f"- Reserve attempts: `{portfolio.get('reserve_attempts')}`",
+        f"- Accepted reservations: `{portfolio.get('accepted_reservations')}`",
+        f"- Released reservations: `{portfolio.get('released_reservations')}`",
+        f"- Ending reserved notional: `${portfolio.get('reserved_notional_usd')}`",
+        f"- Ending available cash: `${portfolio.get('cash_available_usd')}`",
+        "",
+        "## Boundary",
+        "",
+        "This diagnostic checks cash reservation solvency for one frozen variant. It is not a fresh strategy ranking, parameter search, live-trading recommendation, or model promotion.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _gen2_strategy_validation_markdown(payload: Mapping[str, Any]) -> str:
     verdict = payload.get("overall_verdict", {})
     runner = payload.get("weather_model_runner", {})
     score_cache = payload.get("replay_generated_score_cache", {})
     csvs = payload.get("csv_artifacts", {})
     reproducibility = payload.get("reproducibility", {})
+    execution_profile = payload.get("execution_profile_config", {})
+    frozen_inputs = payload.get("frozen_replay_inputs", {})
+    delayed_entry = payload.get("execution_realism", {}).get(
+        "delayed_entry_stress",
+        {},
+    )
+    worse_price = payload.get("execution_realism", {}).get(
+        "fixed_0_01_worse_price_sensitivity",
+        {},
+    )
     ranked = payload.get("ranked_variants", [])[:10]
     lines = [
         "# Gen-2 Strategy Validation",
@@ -7961,6 +8729,22 @@ def _gen2_strategy_validation_markdown(payload: Mapping[str, Any]) -> str:
         f"Leakage violations: `{payload.get('leakage_validation', {}).get('violation_counts')}`",
         f"Fee model: `{payload.get('fee_model', {}).get('fee_model')}`",
         f"Fee rate: `{payload.get('fee_model', {}).get('fee_rate')}`",
+        f"Execution profile: `{payload.get('execution_profile')}`",
+        f"Venue constraints enforced: `{execution_profile.get('enforce_venue_constraints')}`",
+        f"Full-book FOK BUY proof required: `{execution_profile.get('require_full_book_fok_buy_proof')}`",
+        f"Historical tick basis: `{execution_profile.get('historical_tick_basis')}`",
+        f"Historical fee source: `{execution_profile.get('historical_fee_rate_source')}`",
+        f"Decision DB: `{frozen_inputs.get('decision_db')}`",
+        f"Compact price DB: `{frozen_inputs.get('compact_price_db')}`",
+        f"SQLite input mode: `{frozen_inputs.get('sqlite_open_mode')}`",
+        f"Corpus snapshot id: `{frozen_inputs.get('corpus_snapshot_id')}`",
+        f"Maximum replay quote age seconds: `{frozen_inputs.get('max_replay_quote_age_seconds')}`",
+        f"Delayed-entry seconds: `{delayed_entry.get('delay_seconds')}`",
+        f"Delayed-quote maximum wait seconds: `{delayed_entry.get('max_wait_seconds')}`",
+        f"Delayed-entry no fills: `{delayed_entry.get('no_fill_count')}`",
+        f"Delayed-entry no-fill statuses: `{delayed_entry.get('no_fill_status_counts')}`",
+        f"$0.01 scenario kind: `{worse_price.get('scenario_kind')}`",
+        f"$0.01 counterfactual venue validated: `{worse_price.get('counterfactual_price_venue_validated')}`",
         f"Score cache: `{score_cache.get('artifact_path')}`",
         f"Ranked grid CSV: `{csvs.get('ranked_grid_csv')}`",
         f"Full trade ledger CSV: `{csvs.get('trade_ledger')}`",
@@ -7987,7 +8771,8 @@ def _gen2_strategy_validation_markdown(payload: Mapping[str, Any]) -> str:
             "- "
             f"`{row.get('rank_by_net_fee_adjusted_pnl')}` `{row.get('variant_key')}` "
             f"net `{row.get('net_fee_adjusted_pnl_usd')}`, trades `{row.get('trade_count')}`, "
-            f"delayed `{row.get('delayed_entry_net_pnl_usd')}`, worse-fill `{row.get('worse_fill_net_pnl_usd')}`"
+            f"delayed `{row.get('delayed_entry_net_pnl_usd')}`, "
+            f"fixed-$0.01 economic sensitivity `{row.get('fixed_0_01_economic_sensitivity_net_pnl_usd')}`"
         )
     lines.extend(
         [
@@ -8217,9 +9002,14 @@ def _build_candidate_weather_model_runner(
     *,
     work_root: Path,
     source_repo: Optional[Path] = None,
+    corpus_snapshot_id: Optional[str] = None,
 ) -> WeatherModelRunner:
     runner_slug = _weather_runner_slug(weather_runner)
     if runner_slug == "fixture":
+        if corpus_snapshot_id is not None:
+            raise ValueError(
+                "corpus_snapshot_id applies only to the observed-high-guarded runner"
+            )
         return DeterministicFixtureWeatherModelRunner()
     if runner_slug == "observed-high-guarded":
         from .weather_model_runner import ObservedHighGuardedShrinkageWeatherModelRunner
@@ -8227,7 +9017,22 @@ def _build_candidate_weather_model_runner(
         kwargs: dict[str, Any] = {"work_root": Path(work_root).resolve()}
         if source_repo is not None:
             kwargs["source_repo"] = Path(source_repo).expanduser().resolve()
-        return ObservedHighGuardedShrinkageWeatherModelRunner(**kwargs)
+        runner = ObservedHighGuardedShrinkageWeatherModelRunner(**kwargs)
+        normalized_snapshot_id = _normalize_corpus_snapshot_id(corpus_snapshot_id)
+        if normalized_snapshot_id is not None:
+            from .weather_corpus_snapshot import resolve_corpus_snapshot
+
+            resolution = resolve_corpus_snapshot(Path(work_root).resolve())
+            if resolution.snapshot_id != normalized_snapshot_id:
+                raise RuntimeError(
+                    "Pinned corpus snapshot does not match the verified active snapshot: "
+                    f"expected={normalized_snapshot_id} actual={resolution.snapshot_id}"
+                )
+            # The runner already treats this resolution as its immutable, verified
+            # source of truth. Pinning the resolved object prevents a later active
+            # pointer change from switching corpus files during the replay.
+            runner._pinned_corpus_resolution = resolution
+        return runner
     raise AssertionError(runner_slug)
 
 
@@ -8486,6 +9291,48 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=50000,
         help="Print progress every N rows during cap divergence diagnostics; 0 disables progress",
     )
+    gen2_solvency = subparsers.add_parser(
+        "gen2-solvency-report",
+        help="Run a bounded solvency diagnostic for one frozen Gen-2 variant without grid optimization",
+    )
+    gen2_solvency.add_argument("--work-root", default=".", help="Workspace root containing work/")
+    gen2_solvency.add_argument("--output-dir", default=None, help="Optional output directory")
+    gen2_solvency.add_argument(
+        "--variant-key",
+        default="stage_b_old_no_tail_no14_pos10_flat5_whole_bankroll_bprice70",
+        help="Frozen Gen-2 variant key to inspect",
+    )
+    gen2_solvency.add_argument("--limit", type=int, default=0, help="Optional row limit; default scans all official rows")
+    gen2_solvency.add_argument("--starting-cash-usd", type=float, default=100.0)
+    gen2_solvency.add_argument(
+        "--fee-model",
+        choices=(FEE_MODEL_ZERO, FEE_MODEL_POLYMARKET_WEATHER_TAKER),
+        default=DEFAULT_STRATEGY_REPLAY_FEE_MODEL,
+        help="Execution fee model; defaults to polymarket_weather_taker.",
+    )
+    gen2_solvency.add_argument(
+        "--fee-rate",
+        type=float,
+        default=DEFAULT_STRATEGY_REPLAY_FEE_RATE,
+        help="Fee rate override; default is 0.05 for polymarket_weather_taker",
+    )
+    gen2_solvency.add_argument(
+        "--weather-runner",
+        choices=("fixture", "observed-high-guarded"),
+        default="observed-high-guarded",
+        help="Weather model runner used live-like at each decision time",
+    )
+    gen2_solvency.add_argument(
+        "--source-repo",
+        default=None,
+        help="Optional old DailyWeather source checkout for the observed-high guarded runner",
+    )
+    gen2_solvency.add_argument(
+        "--progress-every",
+        type=int,
+        default=50000,
+        help="Print progress every N rows during solvency diagnostics; 0 disables progress",
+    )
     gen2_audit = subparsers.add_parser(
         "gen2-reproducibility-audit",
         help="Audit completed Gen-2 runs for byte-identical ranked-grid and full-ledger outputs",
@@ -8649,6 +9496,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             weather_runner=args.weather_runner,
             source_repo=source_repo,
             progress_every=args.progress_every,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "gen2-solvency-report":
+        work_root = Path(args.work_root).resolve()
+        output_dir = Path(args.output_dir).resolve() if args.output_dir else work_root / "work" / "reports" / "backtesting_engine"
+        source_repo = Path(args.source_repo).expanduser().resolve() if args.source_repo else None
+        result = write_gen2_variant_solvency_report(
+            work_root=work_root,
+            output_dir=output_dir,
+            variant_key=args.variant_key,
+            limit=args.limit,
+            starting_cash_usd=args.starting_cash_usd,
+            weather_runner=args.weather_runner,
+            source_repo=source_repo,
+            progress_every=args.progress_every,
+            fee_model=args.fee_model,
+            fee_rate=args.fee_rate,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
@@ -8908,7 +9773,11 @@ def _fixed_strategy_accounting_report(
         and record.net_fee_adjusted_realized_pnl_usd <= 1e-9
     )
     attempted_fills = sum(fill_status_counts.values())
-    actual_fills = fill_status_counts.get("filled", 0) + fill_status_counts.get("partial_filled", 0)
+    actual_fills = (
+        fill_status_counts.get("filled", 0)
+        + fill_status_counts.get("partial_filled", 0)
+        + fill_status_counts.get("economic_sensitivity_filled", 0)
+    )
     skipped_fills = attempted_fills - actual_fills
     cumulative_pnl = 0.0
     peak_pnl = 0.0
@@ -9333,9 +10202,124 @@ def simulate_order_fill(
                 price_source=price_source,
             )
         requested_shares = order.requested_notional_usd / price
+    order_type = str(order.order_type or "UNSPECIFIED").upper()
+    if order_type == "FAK":
+        return FillResult(
+            fill=None,
+            status="fak_partial_execution_unimplemented",
+            skip_reason=SkipReason.FAK_PARTIAL_EXECUTION_UNIMPLEMENTED,
+            requested_shares=requested_shares,
+            visible_size=visible_size,
+            price_source=price_source,
+        )
+    venue_assessment: Optional[VenueExecutionAssessment] = None
+    effective_fee_config = fee_config
+    if fill_policy.enforce_venue_constraints:
+        assessment_price = order.limit_price if order.limit_price is not None else price
+        assessment_shares = order.requested_shares
+        if (
+            assessment_shares is None
+            and order.requested_notional_usd is not None
+            and assessment_price is not None
+            and assessment_price > 0
+        ):
+            assessment_shares = order.requested_notional_usd / assessment_price
+        venue_assessment = assess_venue_order(
+            constraints=decision.venue_execution_constraints,
+            intended_shares=assessment_shares,
+            limit_price=assessment_price,
+            available_depth_shares=visible_size,
+            intended_notional_usd=order.requested_notional_usd,
+            max_notional_usd=fill_policy.max_order_notional_usd,
+            max_loss_usd=fill_policy.max_order_loss_usd,
+            order_type=order.order_type,
+            side=order.action.value,
+            ask_levels=(decision.quote.ask_levels or None),
+            full_book_complete=decision.quote.full_book_complete,
+            require_full_book=fill_policy.require_full_book_execution,
+            best_ask_price=decision.quote.ask,
+            best_ask_size=decision.quote.ask_size,
+            top_level_provenance=(
+                decision.quote.source_payload_id
+                or decision.quote.source_cache_path
+            ),
+            quote_timestamp_valid=(
+                decision.quote.timestamp_utc
+                <= (
+                    _ensure_utc(fill_timestamp_utc)
+                    if fill_timestamp_utc is not None
+                    else decision.decision_time_utc
+                )
+            ),
+            require_current_market_fee=False,
+            execution_context=HISTORICAL_REPLAY_EXECUTION_CONTEXT,
+            allow_historical_resting_ask_tick_policy=(
+                fill_policy.allow_historical_resting_ask_tick_policy
+            ),
+            direct_polymarket_resting_ask_provenance=(
+                decision.quote.direct_polymarket_resting_ask_provenance
+            ),
+            raw_compact_decision_passthrough_verified=(
+                decision.quote.raw_compact_decision_passthrough_verified
+            ),
+            quote_non_crossed=(
+                decision.quote.bid is not None
+                and decision.quote.ask is not None
+                and decision.quote.ask >= decision.quote.bid
+                and "crossed_quote"
+                not in {
+                    str(flag).strip().lower()
+                    for flag in decision.quote.data_quality_flags
+                }
+            ),
+            price_transformation_applied=(
+                decision.quote.price_transformation_applied
+            ),
+        )
+        if not venue_assessment.eligible:
+            return FillResult(
+                fill=None,
+                status="venue_execution_ineligible",
+                skip_reason=_primary_venue_skip_reason(venue_assessment),
+                requested_shares=requested_shares,
+                visible_size=visible_size,
+                price_source=price_source,
+                venue_execution_assessment=venue_assessment.as_report_dict(),
+            )
+        constraints = decision.venue_execution_constraints
+        if constraints is not None and constraints.fee_rate is not None:
+            effective_fee_config = FeeModelConfig(
+                fee_model=FEE_MODEL_POLYMARKET_WEATHER_TAKER,
+                fee_rate=constraints.fee_rate,
+            )
+
+    full_book_execution = bool(
+        venue_assessment is not None
+        and venue_assessment.execution_basis
+        in {
+            "top_level_proves_full_fill",
+            "full_order_book_fok_buy_usdc_walk",
+            HISTORICAL_RESTING_ASK_TICK_BASIS,
+        }
+    )
+    if full_book_execution:
+        requested_shares = venue_assessment.cumulative_shares or 0.0
+        price = venue_assessment.weighted_average_price or 0.0
+        visible_size = venue_assessment.available_depth_shares
+        price_source = (
+            "historical_observed_resting_best_ask"
+            if venue_assessment.execution_basis
+            == HISTORICAL_RESTING_ASK_TICK_BASIS
+            else "full_order_book_weighted_average"
+        )
+
     filled_shares = requested_shares
-    if visible_size is not None and visible_size < requested_shares:
-        if not fill_policy.allow_partial:
+    if (
+        not full_book_execution
+        and visible_size is not None
+        and visible_size < requested_shares
+    ):
+        if order_type == "FOK" or not fill_policy.allow_partial:
             return FillResult(
                 fill=None,
                 status="insufficient_visible_size",
@@ -9355,10 +10339,14 @@ def simulate_order_fill(
             visible_size=visible_size,
             price_source=price_source,
         )
-    fee_usd = calculate_fill_fee_usd(
-        shares=filled_shares,
-        price=price,
-        fee_config=fee_config,
+    fee_usd = (
+        venue_assessment.fee_usd
+        if full_book_execution and venue_assessment is not None
+        else calculate_fill_fee_usd(
+            shares=filled_shares,
+            price=price,
+            fee_config=effective_fee_config,
+        )
     )
     fill = Fill(
         token_id=order.token_id,
@@ -9368,11 +10356,11 @@ def simulate_order_fill(
         price=price,
         shares=filled_shares,
         fee_usd=fee_usd,
-        fee_model=fee_config.fee_model,
-        fee_rate=fee_config.resolved_fee_rate,
+        fee_model=effective_fee_config.fee_model,
+        fee_rate=effective_fee_config.resolved_fee_rate,
         liquidity_role=(
             "taker"
-            if fee_config.fee_model == FEE_MODEL_POLYMARKET_WEATHER_TAKER
+            if effective_fee_config.fee_model == FEE_MODEL_POLYMARKET_WEATHER_TAKER
             else "none"
         ),
         decision_id=order.decision_id,
@@ -9385,7 +10373,29 @@ def simulate_order_fill(
         filled_shares=filled_shares,
         visible_size=visible_size,
         price_source=price_source,
+        venue_execution_assessment=(
+            venue_assessment.as_report_dict() if venue_assessment else None
+        ),
     )
+
+
+def _primary_venue_skip_reason(assessment: VenueExecutionAssessment) -> SkipReason:
+    reasons = set(assessment.reasons)
+    if any(reason.startswith("missing_venue_") for reason in reasons):
+        return SkipReason.MISSING_VENUE_METADATA
+    if "order_price_off_tick" in reasons:
+        return SkipReason.ORDER_PRICE_OFF_TICK
+    if "insufficient_venue_depth" in reasons:
+        return SkipReason.INSUFFICIENT_VISIBLE_SIZE
+    if "venue_notional_cap_exceeded" in reasons:
+        return SkipReason.VENUE_NOTIONAL_CAP_EXCEEDED
+    if "venue_maximum_loss_cap_exceeded" in reasons:
+        return SkipReason.VENUE_MAXIMUM_LOSS_CAP_EXCEEDED
+    if "unverified_venue_minimum_size_semantics" in reasons:
+        return SkipReason.UNVERIFIED_VENUE_MINIMUM_SIZE_SEMANTICS
+    if "fak_partial_execution_unimplemented" in reasons:
+        return SkipReason.FAK_PARTIAL_EXECUTION_UNIMPLEMENTED
+    return SkipReason.INVALID_VENUE_METADATA
 
 
 def _fill_order_from_quote(order: OrderIntent, decision: DecisionSnapshot) -> Optional[Fill]:
@@ -9490,6 +10500,15 @@ def _quote_snapshot_from_compact_row(row: Mapping[str, Any]) -> Optional[QuoteSn
         source_payload_id=row.get("source_payload_id"),
         source_cache_path=row.get("source_cache_path"),
         data_quality_flags=_json_flags(row.get("data_quality_flags")),
+        direct_polymarket_resting_ask_provenance=_boolish(
+            row.get("direct_polymarket_resting_ask_provenance")
+        ),
+        raw_compact_decision_passthrough_verified=_boolish(
+            row.get("raw_compact_decision_passthrough_verified")
+        ),
+        price_transformation_applied=_optional_bool(
+            row.get("price_transformation_applied")
+        ),
     )
 
 
@@ -9499,6 +10518,13 @@ def _quote_with_worse_fill_tick(
     action: OrderAction,
     tick: float = DEFAULT_WORSE_FILL_TICK,
 ) -> QuoteSnapshot:
+    """Return a transformed quote for diagnostics, never venue-valid proof.
+
+    The legacy function name is retained for callers, but ``tick`` is a fixed
+    absolute price delta. ``price_transformation_applied=True`` ensures the
+    historical resting-ask tick exception rejects it.
+    """
+
     bid = quote.bid
     ask = quote.ask
     if action == OrderAction.BUY and ask is not None:
@@ -9510,13 +10536,58 @@ def _quote_with_worse_fill_tick(
     if bid is not None and ask is not None:
         spread = max(0.0, ask - bid)
         mid = (bid + ask) / 2.0
-    return replace(quote, bid=bid, ask=ask, mid=mid, spread=spread)
+    return replace(
+        quote,
+        bid=bid,
+        ask=ask,
+        mid=mid,
+        spread=spread,
+        price_transformation_applied=True,
+    )
 
 
 def _optional_float(value: Any) -> Optional[float]:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _venue_constraints_from_row(
+    row: Mapping[str, Any],
+) -> Optional[VenueExecutionConstraints]:
+    minimum = _first_row_optional_float(
+        row,
+        ("min_order_size_shares", "min_order_size", "minimum_order_size"),
+    )
+    tick_size = _first_row_optional_float(row, ("venue_tick_size", "tick_size"))
+    fee_rate = _first_row_optional_float(
+        row,
+        ("venue_fee_rate", "weather_taker_fee_rate", "fee_rate"),
+    )
+    if minimum is None and tick_size is None and fee_rate is None:
+        return None
+    return VenueExecutionConstraints(
+        min_order_size_shares=minimum,
+        tick_size=tick_size,
+        fee_rate=fee_rate,
+        fee_rate_source=str(
+            row.get("venue_fee_rate_source")
+            or row.get("fee_rate_source")
+            or ""
+        )
+        or None,
+    )
+
+
+def _first_row_optional_float(
+    row: Mapping[str, Any],
+    keys: Sequence[str],
+) -> Optional[float]:
+    for key in keys:
+        value = _optional_float(row.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _optional_int(value: Any) -> Optional[int]:
@@ -9538,6 +10609,12 @@ def _boolish(value: Any) -> bool:
     if value in (None, ""):
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _optional_bool(value: Any) -> Optional[bool]:
+    if value in (None, ""):
+        return None
+    return _boolish(value)
 
 
 def _json_flags(value: Any) -> tuple[str, ...]:
@@ -9569,10 +10646,225 @@ def _json_mapping(value: Any) -> Mapping[str, Any]:
     return parsed if isinstance(parsed, Mapping) else {}
 
 
+def _json_book_levels(value: Any) -> tuple[Mapping[str, float], ...]:
+    if value in (None, ""):
+        return ()
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(parsed, (list, tuple)):
+        return ()
+    return tuple(dict(item) for item in parsed if isinstance(item, Mapping))
+
+
 def _pipe_flags(value: Any) -> tuple[str, ...]:
     if value in (None, ""):
         return ()
     return tuple(part for part in str(value).split("|") if part)
+
+
+def _sqlite_sidecar_paths(database: Path) -> tuple[Path, ...]:
+    resolved = Path(database).expanduser().resolve()
+    return tuple(
+        Path(f"{resolved}{suffix}")
+        for suffix in ("-wal", "-shm", "-journal")
+    )
+
+
+def _assert_frozen_sqlite_sidecar_free(database: Path) -> None:
+    resolved = Path(database).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    sidecars = [
+        str(path)
+        for path in _sqlite_sidecar_paths(resolved)
+        if os.path.lexists(path)
+    ]
+    if sidecars:
+        raise RuntimeError(
+            "Frozen SQLite input has WAL/SHM sidecars or a rollback journal and cannot be opened "
+            f"immutably: {resolved}; sidecars={','.join(sidecars)}"
+        )
+
+
+def _sqlite_read_only_uri(database: Path, *, immutable: bool = False) -> str:
+    resolved = Path(database).expanduser().resolve()
+    if immutable:
+        _assert_frozen_sqlite_sidecar_free(resolved)
+    encoded_path = url_quote(str(resolved), safe="/:")
+    immutable_flag = "&immutable=1" if immutable else ""
+    return f"file:{encoded_path}?mode=ro{immutable_flag}"
+
+
+def _normalize_corpus_snapshot_id(
+    corpus_snapshot_id: Optional[str],
+) -> Optional[str]:
+    if corpus_snapshot_id is None:
+        return None
+    normalized = str(corpus_snapshot_id).strip()
+    if (
+        len(normalized) != 64
+        or normalized.lower() != normalized
+        or any(character not in "0123456789abcdef" for character in normalized)
+    ):
+        raise ValueError("corpus_snapshot_id must be a 64-character lowercase SHA-256 id")
+    return normalized
+
+
+def simulate_fixed_worse_price_economic_sensitivity(
+    order: OrderIntent,
+    decision: DecisionSnapshot,
+    *,
+    price_delta_usd: float = DEFAULT_WORSE_FILL_TICK,
+    fill_policy: FillPolicy = FillPolicy(),
+    fee_config: FeeModelConfig = FeeModelConfig(),
+    base_fill_result: Optional[FillResult] = None,
+) -> FillResult:
+    """Apply a PnL-only adverse price delta after base execution is proven.
+
+    The counterfactual price is deliberately *not* submitted to the venue
+    assessor. A synthetic ``+$0.01`` price has neither captured tick metadata
+    nor an observed resting-order provenance chain, so calling it executable
+    would overstate the evidence. Base execution must first pass the selected
+    fill policy; base no-fills remain no-fills and are reported separately.
+    """
+
+    if price_delta_usd <= 0:
+        raise ValueError("Economic sensitivity price delta must be positive")
+    if abs(price_delta_usd - DEFAULT_FIXED_WORSE_PRICE_DELTA_USD) > 1e-12:
+        raise ValueError(
+            "fixed_0_01_worse_price_sensitivity requires price delta 0.01"
+        )
+    base = base_fill_result or simulate_order_fill(
+        order,
+        decision,
+        fill_policy=fill_policy,
+        fee_config=fee_config,
+    )
+    base_venue_eligible = (
+        base.venue_execution_assessment.get("eligible")
+        if isinstance(base.venue_execution_assessment, Mapping)
+        else None
+    )
+    audit: dict[str, Any] = {
+        "scenario": FIXED_WORSE_PRICE_STRESS_SCENARIO,
+        "scenario_kind": "economic_counterfactual_after_proven_base_execution",
+        "economic_sensitivity_only": True,
+        "base_execution_required": True,
+        "base_execution_status": base.status,
+        "base_execution_venue_eligible": base_venue_eligible,
+        "price_delta_usd": price_delta_usd,
+        "counterfactual_price_venue_validated": False,
+        "counterfactual_price_tick_validated": False,
+        "counterfactual_price_limit_validated": False,
+        "counterfactual_order_submitted_or_reexecuted": False,
+    }
+    if base.fill is None:
+        audit["counterfactual_emitted"] = False
+        audit["no_fill_kind"] = "base_execution_ineligible_or_unfilled"
+        return replace(
+            base,
+            status=f"economic_sensitivity_not_run_base_{base.status}",
+            economic_sensitivity_assessment=audit,
+        )
+
+    base_fill = base.fill
+    if order.action == OrderAction.BUY:
+        counterfactual_price = min(1.0, base_fill.price + price_delta_usd)
+    elif order.action == OrderAction.SELL:
+        counterfactual_price = base_fill.price - price_delta_usd
+    else:
+        counterfactual_price = 0.0
+    if counterfactual_price <= 0 or counterfactual_price > 1:
+        audit.update(
+            {
+                "counterfactual_emitted": False,
+                "no_fill_kind": "economic_counterfactual_price_out_of_range",
+                "base_fill_price": base_fill.price,
+                "counterfactual_fill_price": counterfactual_price,
+            }
+        )
+        return FillResult(
+            fill=None,
+            status="economic_sensitivity_price_out_of_range",
+            skip_reason=SkipReason.MISSING_EXECUTABLE_PRICE,
+            requested_shares=base.requested_shares,
+            visible_size=base.visible_size,
+            price_source="economic_counterfactual_not_venue_execution",
+            venue_execution_assessment=base.venue_execution_assessment,
+            economic_sensitivity_assessment=audit,
+        )
+
+    if order.requested_notional_usd is not None:
+        counterfactual_shares = order.requested_notional_usd / counterfactual_price
+        size_semantics = "fixed_requested_notional_recomputed_shares"
+    elif order.requested_shares is not None:
+        counterfactual_shares = order.requested_shares
+        size_semantics = "fixed_requested_shares"
+    else:
+        counterfactual_shares = base_fill.shares
+        size_semantics = "base_fill_shares"
+    counterfactual_fee_config = FeeModelConfig(
+        fee_model=base_fill.fee_model,
+        fee_rate=base_fill.fee_rate,
+    )
+    counterfactual_fee = calculate_fill_fee_usd(
+        shares=counterfactual_shares,
+        price=counterfactual_price,
+        fee_config=counterfactual_fee_config,
+    )
+    audit.update(
+        {
+            "counterfactual_emitted": True,
+            "no_fill_kind": None,
+            "base_fill_price": base_fill.price,
+            "counterfactual_fill_price": counterfactual_price,
+            "realized_price_delta_usd": counterfactual_price - base_fill.price,
+            "size_semantics": size_semantics,
+            "counterfactual_notional_usd": (
+                counterfactual_price * counterfactual_shares
+            ),
+        }
+    )
+    fill = replace(
+        base_fill,
+        price=counterfactual_price,
+        shares=counterfactual_shares,
+        fee_usd=counterfactual_fee,
+    )
+    return FillResult(
+        fill=fill,
+        status="economic_sensitivity_filled",
+        skip_reason=None,
+        requested_shares=counterfactual_shares,
+        filled_shares=counterfactual_shares,
+        visible_size=base.visible_size,
+        price_source="economic_counterfactual_not_venue_execution",
+        venue_execution_assessment=base.venue_execution_assessment,
+        economic_sensitivity_assessment=audit,
+    )
+
+
+def _first_present_row_value(
+    row: Mapping[str, Any],
+    keys: Sequence[str],
+) -> Any:
+    """Return the first physically present field, preserving falsey values.
+
+    Aliased decision-view fields take precedence over unprefixed compatibility
+    fields. Presence, rather than truthiness, is required because an audited
+    explicit ``False`` must never fall through to a conflicting legacy
+    ``True`` value.
+    """
+
+    present_keys = set(row.keys())
+    for key in keys:
+        if key in present_keys:
+            return row[key]
+    return None
 
 
 if __name__ == "__main__":

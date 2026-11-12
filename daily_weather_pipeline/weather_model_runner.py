@@ -27,7 +27,6 @@ from .weather_model_validation import (
     ForecastRow,
     MarketRow,
     ValidationRow,
-    _artifact_paths,
     _bucket_shape,
     _build_validation_rows,
     _clip_probability,
@@ -38,9 +37,17 @@ from .weather_model_validation import (
     _load_markets,
     _load_realized,
     _load_weather_strategy,
+    resolve_training_corpus_end_date,
     _score_model_probabilities,
     _threshold_distance,
     _weighted_consensus_probability,
+)
+from .weather_corpus_coverage import weather_corpus_coverage
+from .weather_corpus_snapshot import (
+    CorpusResolution,
+    resolve_controlled_corpus_candidate,
+    resolve_corpus_snapshot,
+    resolve_explicit_corpus_override,
 )
 
 
@@ -54,6 +61,8 @@ MODEL_VERSION = "observed_high_guarded_shrinkage_research_runner_v1"
 DEFAULT_CONFIG_ID = (
     "observed_guarded|tail=0.006|far=1.00|city_guard=0.25|region_guard=0.70"
 )
+TRAINING_CORPUS_STALENESS_WARNING_DAYS = 3
+OPERATIONAL_CORPUS_LOOKBACK_DAYS = 4
 
 
 @dataclass
@@ -68,6 +77,9 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
     label_availability_lag_hours: float = 12.0
     historical_rows: Optional[Sequence[ValidationRow]] = None
     baseline_probability_provider: Optional[BaselineProvider] = None
+    corpus_market_db: Optional[Path] = None
+    corpus_weather_db: Optional[Path] = None
+    corpus_override_provenance: Optional[str] = None
     model_version: str = MODEL_VERSION
     _strategy: Optional[Mapping[str, Any]] = field(default=None, init=False, repr=False)
     _rows: Optional[list[ValidationRow]] = field(default=None, init=False, repr=False)
@@ -79,6 +91,15 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
     _last_fit_cache_key: Optional[datetime] = field(default=None, init=False, repr=False)
     _last_fit_cache: dict[tuple[str, int], Any] = field(
         default_factory=dict, init=False, repr=False
+    )
+    _last_operational_coverage_key: Optional[tuple[Any, ...]] = field(
+        default=None, init=False, repr=False
+    )
+    _last_operational_coverage: Optional[Mapping[str, Any]] = field(
+        default=None, init=False, repr=False
+    )
+    _pinned_corpus_resolution: Optional[CorpusResolution] = field(
+        default=None, init=False, repr=False
     )
 
     @property
@@ -116,6 +137,8 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
             {
                 "model_version": self.model_version,
                 "config_id": config.config_id,
+                "training_corpus_start_date": self.start.isoformat(),
+                "training_corpus_configured_end_date": self.end.isoformat(),
                 "family": config.family,
                 "kind": config.kind,
                 "params": dict(config.params),
@@ -143,6 +166,19 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
         score_row.mean_probability = _mean_probability(model_probabilities, baseline_probability)
         score_row.model_probabilities = dict(model_probabilities)
         train_rows = self._training_rows_for(context.decision_time_utc)
+        training_summary = self.training_corpus_summary(as_of_utc=context.decision_time_utc)
+        city_coverage = next(
+            (
+                item
+                for item in (
+                    (training_summary.get("training_corpus_operational_coverage") or {}).get(
+                        "city_coverage", []
+                    )
+                )
+                if str(item.get("normalized_city")) == context.normalized_city
+            ),
+            None,
+        )
         observed_context = self._observed_context_for(context, score_row)
         fit_cache = self._fit_cache_for(context.decision_time_utc)
         probabilities = _predict_config(
@@ -193,6 +229,33 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
                 "config_id": self.config_id,
                 "baseline_probability": baseline_probability,
                 "train_rows": len(train_rows),
+                "training_row_count": int(training_summary["training_row_count"]),
+                "training_corpus_end_date": training_summary["training_corpus_end_date"],
+                "training_corpus_configured_end_date": training_summary[
+                    "training_corpus_configured_end_date"
+                ],
+                "training_corpus_loaded_row_count": int(
+                    training_summary["training_corpus_loaded_row_count"]
+                ),
+                "training_corpus_staleness_days": training_summary[
+                    "training_corpus_staleness_days"
+                ],
+                "training_corpus_staleness_warning": bool(
+                    training_summary["training_corpus_staleness_warning"]
+                ),
+                "training_corpus_operationally_fresh": training_summary.get(
+                    "training_corpus_operationally_fresh"
+                ),
+                "training_corpus_coverage_available": training_summary.get(
+                    "training_corpus_coverage_available"
+                ),
+                "training_corpus_city_coverage": city_coverage,
+                "training_corpus_snapshot_id": training_summary.get(
+                    "training_corpus_snapshot_id"
+                ),
+                "training_corpus_snapshot_source": training_summary.get(
+                    "training_corpus_snapshot_source"
+                ),
                 "label_availability_lag_hours": self.label_availability_lag_hours,
                 "forecast_as_of_utc": (
                     context.forecast_run_time_utc.isoformat()
@@ -227,6 +290,109 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
         self._last_fit_cache = {}
         return rows
 
+    def training_corpus_summary(
+        self,
+        *,
+        as_of_utc: Optional[datetime] = None,
+        staleness_warning_days: int = TRAINING_CORPUS_STALENESS_WARNING_DAYS,
+    ) -> Mapping[str, Any]:
+        as_of = _normalize_utc(as_of_utc or datetime.now(timezone.utc))
+        training_rows = self._training_rows_for(as_of)
+        loaded_rows = self._load_rows()
+        corpus_end = max((row.market_date_local for row in training_rows), default=None)
+        staleness_days: Optional[int]
+        if corpus_end is None:
+            staleness_days = None
+            global_warning = True
+            warning_flags = ["training_corpus_empty"]
+        else:
+            staleness_days = max(0, (as_of.date() - corpus_end).days)
+            global_warning = staleness_days > int(staleness_warning_days)
+            warning_flags = list(
+                ("training_corpus_stale_gt_3d",)
+                if global_warning and int(staleness_warning_days) == 3
+                else (f"training_corpus_stale_gt_{int(staleness_warning_days)}d",)
+                if global_warning
+                else ()
+            )
+        operational_coverage: Optional[Mapping[str, Any]] = None
+        if self.historical_rows is None:
+            operational_coverage = self._operational_corpus_coverage(as_of)
+            if not bool(operational_coverage.get("operationally_fresh")):
+                warning_flags.append("training_corpus_city_source_date_coverage_incomplete")
+        operational_warning = (
+            operational_coverage is not None
+            and not bool(operational_coverage.get("operationally_fresh"))
+        )
+        warning = bool(global_warning or operational_warning)
+        resolution = self._corpus_resolution() if self.historical_rows is None else None
+        return {
+            "training_corpus_start_date": self.start.isoformat(),
+            "training_corpus_configured_end_date": self.end.isoformat(),
+            "training_corpus_end_date": corpus_end.isoformat() if corpus_end else None,
+            "training_row_count": len(training_rows),
+            "training_corpus_loaded_row_count": len(loaded_rows),
+            "training_corpus_as_of_utc": as_of.isoformat(),
+            "training_corpus_staleness_days": staleness_days,
+            "training_corpus_staleness_warning": warning,
+            "training_corpus_staleness_warning_threshold_days": int(staleness_warning_days),
+            "warning_flags": tuple(dict.fromkeys(warning_flags)),
+            "training_corpus_coverage_available": (
+                operational_coverage.get("coverage_available")
+                if operational_coverage is not None
+                else None
+            ),
+            "training_corpus_operationally_fresh": (
+                operational_coverage.get("operationally_fresh")
+                if operational_coverage is not None
+                else None
+            ),
+            "training_corpus_operational_coverage": operational_coverage,
+            "training_corpus_snapshot_id": resolution.snapshot_id if resolution else None,
+            "training_corpus_snapshot_source": resolution.source if resolution else "fixture_rows",
+            "label_availability_lag_hours": self.label_availability_lag_hours,
+        }
+
+    def _operational_corpus_coverage(self, as_of: datetime) -> Mapping[str, Any]:
+        root = Path(self.work_root).resolve()
+        resolution = self._corpus_resolution()
+        store_versions = tuple(
+            observation
+            for path in (resolution.market_db, resolution.weather_db)
+            for observation in _sqlite_store_version(path)
+        )
+        cache_key = (
+            as_of.isoformat(),
+            self.start.isoformat(),
+            self.end.isoformat(),
+            float(self.label_availability_lag_hours),
+            *store_versions,
+        )
+        if (
+            self._last_operational_coverage_key == cache_key
+            and self._last_operational_coverage is not None
+        ):
+            return self._last_operational_coverage
+        coverage_end = min(self.end, as_of.date())
+        coverage_start = max(
+            self.start,
+            coverage_end - timedelta(days=OPERATIONAL_CORPUS_LOOKBACK_DAYS),
+        )
+        coverage = weather_corpus_coverage(
+            work_root=root,
+            start=coverage_start,
+            end=coverage_end,
+            as_of_utc=as_of,
+            label_availability_lag_hours=self.label_availability_lag_hours,
+            market_db=resolution.market_db,
+            weather_db=resolution.weather_db,
+            snapshot_id=resolution.snapshot_id,
+            snapshot_source=resolution.source,
+        )
+        self._last_operational_coverage_key = cache_key
+        self._last_operational_coverage = coverage
+        return coverage
+
     def _fit_cache_for(self, decision_time_utc: datetime) -> dict[tuple[str, int], Any]:
         if self._last_fit_cache_key != decision_time_utc:
             self._last_fit_cache_key = decision_time_utc
@@ -235,19 +401,96 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
 
     def _load_rows(self) -> list[ValidationRow]:
         if self._rows is not None:
+            if self.historical_rows is None:
+                self._corpus_resolution()
             return self._rows
         if self.historical_rows is not None:
             self._rows = list(self.historical_rows)
             self._index_city_metadata(self._rows)
             return self._rows
         strategy = self._load_strategy()
-        paths = _artifact_paths(Path(self.work_root).resolve())
-        markets = _load_markets(paths["market_db"], start=self.start, end=self.end)
-        forecasts = _load_forecasts(paths["weather_db"], start=self.start, end=self.end)
-        realized = _load_realized(paths["weather_db"], start=self.start, end=self.end)
+        resolution = self._corpus_resolution()
+        immutable = resolution.source == "active_immutable_snapshot"
+        reject_sidecars = resolution.source in {
+            "active_immutable_snapshot",
+            "copy_on_write_candidate",
+            "explicit_sidecar_free_override",
+        }
+        allow_zero_length_wal = resolution.source == "copy_on_write_candidate"
+        markets = _load_markets(
+            resolution.market_db,
+            start=self.start,
+            end=self.end,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=resolution.source,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+        forecasts = _load_forecasts(
+            resolution.weather_db,
+            start=self.start,
+            end=self.end,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=resolution.source,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
+        realized = _load_realized(
+            resolution.weather_db,
+            start=self.start,
+            end=self.end,
+            immutable=immutable,
+            reject_sidecars=reject_sidecars,
+            sidecar_reason_prefix=resolution.source,
+            allow_zero_length_wal=allow_zero_length_wal,
+        )
         self._rows = _build_validation_rows(strategy, markets, forecasts, realized)
         self._index_city_metadata(self._rows)
         return self._rows
+
+    def _corpus_resolution(self) -> CorpusResolution:
+        if self._pinned_corpus_resolution is not None:
+            if self._pinned_corpus_resolution.source == "copy_on_write_candidate":
+                resolve_controlled_corpus_candidate(
+                    Path(self.work_root).resolve(),
+                    self._pinned_corpus_resolution.market_db,
+                    self._pinned_corpus_resolution.weather_db,
+                )
+            elif self._pinned_corpus_resolution.source == "explicit_sidecar_free_override":
+                resolve_explicit_corpus_override(
+                    self._pinned_corpus_resolution.market_db,
+                    self._pinned_corpus_resolution.weather_db,
+                )
+            return self._pinned_corpus_resolution
+        if (self.corpus_market_db is None) != (self.corpus_weather_db is None):
+            raise ValueError(
+                "corpus_market_db and corpus_weather_db overrides must be supplied together"
+            )
+        if self.corpus_market_db is None and self.corpus_override_provenance is not None:
+            raise ValueError(
+                "corpus_override_provenance requires explicit corpus database paths"
+            )
+        if self.corpus_market_db is not None and self.corpus_weather_db is not None:
+            if self.corpus_override_provenance == "copy_on_write_candidate":
+                resolution = resolve_controlled_corpus_candidate(
+                    Path(self.work_root).resolve(),
+                    Path(self.corpus_market_db),
+                    Path(self.corpus_weather_db),
+                )
+            elif self.corpus_override_provenance is None:
+                resolution = resolve_explicit_corpus_override(
+                    Path(self.corpus_market_db),
+                    Path(self.corpus_weather_db),
+                )
+            else:
+                raise ValueError(
+                    "unsupported corpus_override_provenance:"
+                    f"{self.corpus_override_provenance}"
+                )
+        else:
+            resolution = resolve_corpus_snapshot(Path(self.work_root).resolve())
+        self._pinned_corpus_resolution = resolution
+        return resolution
 
     def _load_strategy(self) -> Mapping[str, Any]:
         if self._strategy is None:
@@ -464,6 +707,17 @@ class ObservedHighGuardedShrinkageWeatherModelRunner:
         }
 
 
+def _sqlite_store_version(path: Path) -> tuple[Any, ...]:
+    observations: list[Any] = []
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        if candidate.exists():
+            metadata = candidate.stat()
+            observations.extend((True, metadata.st_size, metadata.st_mtime_ns))
+        else:
+            observations.extend((False, None, None))
+    return tuple(observations)
+
+
 def _label_available_at_utc(row: ValidationRow, lag_hours: float) -> datetime:
     try:
         zone = ZoneInfo(row.timezone_name)
@@ -475,6 +729,12 @@ def _label_available_at_utc(row: ValidationRow, lag_hours: float) -> datetime:
         tzinfo=zone,
     )
     return local_end.astimezone(timezone.utc) + timedelta(hours=float(lag_hours))
+
+
+def _normalize_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _local_hour(decision_time_utc: datetime, timezone_name: str) -> float:

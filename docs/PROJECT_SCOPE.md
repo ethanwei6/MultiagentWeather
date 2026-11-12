@@ -1,22 +1,7 @@
-# Project Scope
+# Project scope
 
-MultiagentWeather is focused on daily-high temperature market research and tooling.
+MultiagentWeather publishes the DailyWeather research package and its interactive portfolio. The research package covers weather and market schemas, empirical temperature-bucket probabilities, point-in-time model comparison, backtesting, settlement-label audits and forward-shadow measurement.
 
-Core technical surfaces:
+The public showcase demonstrates the signal policy and payout accounting on fictional trades. Aggregate historical validation results describe the forecast model family. The underlying historical market and station archives are supplied locally for research runs. The [data policy](DATA_POLICY.md) describes the shipped fixtures and handling of source data.
 
-- normalize market and weather artifacts into auditable local stores
-- validate daily-high weather probability models without label leakage
-- compare model outputs against market prices when point-in-time quotes exist
-- replay candidate trading rules using point-in-time data
-- audit settlement labels and weather-observation assumptions
-- run forward-shadow collection before any live deployment decision
-
-The public repository does not include private strategy handoff notes, private prompts, agent memory, live credentials, generated datasets, or live-trading operational records.
-
-## Non-Goals For The Public Repo
-
-- publishing private API credentials
-- publishing large historical quote/weather databases
-- publishing live ledger artifacts
-- presenting private strategy decisions as public financial advice
-
+Use the [main README](../README.md) to run the offline tests or start the showcase.

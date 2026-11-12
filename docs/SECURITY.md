@@ -1,30 +1,7 @@
 # Security
 
-This project may be used with paid data APIs and trading infrastructure. Treat credentials as production secrets.
+The public showcase and offline tests require no secrets. Some optional research commands can read credentials for external data providers. Keep those credentials in the local environment. Use synthetic literals in tests.
 
-## Never Commit
+For a public release, review the staged file list, inspect new data fields and third-party assets, run the research tests and frontend build, and scan the exact proposed tree and Git history. The GitHub workflow uses Gitleaks with redacted findings and read-only repository access. Build outputs, private database files, hosted-site manifests and local credential files are ignored.
 
-- `.env` files
-- API keys
-- wallet private keys or seed phrases
-- CLOB credentials
-- funded wallet addresses tied to private operations
-- private agent briefs or memory files
-- raw live ledgers
-- generated logs or reports that may include operational context
-
-## Local Credentials
-
-Use environment variables or a local `.env` file for credentials. `.env` files are ignored by `.gitignore`.
-
-Do not put real credential values in documentation, tests, fixtures, notebooks, logs, or screenshots.
-
-## Release Gate
-
-Before pushing public changes:
-
-1. Confirm the staged file list contains only intended source, tests, and public docs.
-2. Run unit tests.
-3. Run a redacted secret scan over the exact tree being pushed.
-4. Treat any private-key block, API key, wallet key, seed phrase, or credential-looking assignment as a hard stop until manually cleared.
-
+If you discover an exposed credential, contact the maintainer privately using a reporting channel that does not publish its value. Revoke or rotate the credential before addressing copies in Git history.

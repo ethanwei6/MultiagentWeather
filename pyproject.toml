@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,9 +7,12 @@ name = "multiagentweather"
 version = "0.1.0"
 description = "Daily-high temperature prediction-market research tooling"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12,<3.13"
 authors = [{ name = "Ethan Wei" }]
-dependencies = []
+dependencies = ["polars==1.36.1"]
+
+[project.scripts]
+dailyweather = "daily_weather_pipeline.cli:main"
 
 [tool.setuptools]
 packages = ["daily_weather_pipeline"]

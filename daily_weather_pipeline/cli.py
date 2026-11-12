@@ -12,6 +12,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
@@ -20,11 +21,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEFAULT_SOURCE_REPO = Path(
-    os.environ.get(
-        "DAILYWEATHER_SOURCE_REPO",
-        "/Users/ethanwei/Documents/Codex/2026-06-04/i-want-to-explore-a-few",
-    )
-)
+    os.environ.get("WEATHER_SOURCE_REPO") or os.environ.get("DAILYWEATHER_SOURCE_REPO") or "vendor/weather_strategy"
+).expanduser()
 DEFAULT_START_DATE = date(2025, 6, 30)
 DEFAULT_END_DATE = date(2026, 6, 29)
 ENTRY_HOURS_UTC = (0, 6, 12, 18)
@@ -153,6 +151,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     weather.add_argument("--cache-only", action="store_true", help="Use existing Open-Meteo raw JSON only; do not call the network")
     weather.add_argument("--forecast-mode", choices=("single-runs", "historical-forecast"), default="single-runs")
 
+    corpus = subparsers.add_parser("weather-corpus-extend", help="Extend local market/weather corpus for live shadow scoring without Telonex")
+    corpus.add_argument("--start-date", default=None, help="Defaults to as-of date minus 4 days")
+    corpus.add_argument("--end-date", default=None, help="Defaults to as-of UTC date")
+    corpus.add_argument("--as-of-utc", default=None)
+    corpus.add_argument("--cache-only", action="store_true", help="Use cached Gamma/Open-Meteo payloads only")
+    corpus.add_argument(
+        "--market-discovery-mode",
+        choices=("cached", "online", "cached-and-online"),
+        default="cached-and-online",
+    )
+    corpus.add_argument("--gamma-city-limit", type=int, default=0, help="Limit default city slug probes; 0 means all")
+    corpus.add_argument("--weather-pair-limit", type=int, default=0, help="Limit label-available city/date weather fetches; 0 means all")
+    corpus.add_argument("--report-dir", default="work/reports/strategy_review")
+
     decision = subparsers.add_parser("decision-artifact", help="Join markets, quotes, forecasts, and labels at live cadence")
     decision.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat())
     decision.add_argument("--end-date", default=DEFAULT_END_DATE.isoformat())
@@ -255,6 +267,57 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+    if args.command == "weather-corpus-extend":
+        from .weather_corpus_extension import DEFAULT_LOOKBACK_DAYS, run_weather_corpus_extension
+        from .weather_corpus_snapshot import CorpusSnapshotError, CorpusWriterLockError
+
+        as_of = _parse_datetime(args.as_of_utc) if args.as_of_utc else datetime.now(timezone.utc)
+        if as_of is None:
+            raise ValueError(f"Invalid --as-of-utc: {args.as_of_utc}")
+        as_of = as_of.astimezone(timezone.utc) if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+        start = _parse_date_arg(args.start_date) if args.start_date else as_of.date() - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+        end = _parse_date_arg(args.end_date) if args.end_date else as_of.date()
+        try:
+            result = run_weather_corpus_extension(
+                paths=paths,
+                source_repo=Path(args.source_repo).expanduser(),
+                start=start,
+                end=end,
+                as_of_utc=as_of,
+                cache_only=args.cache_only,
+                market_discovery_mode=args.market_discovery_mode,
+                gamma_city_limit=args.gamma_city_limit,
+                weather_pair_limit=args.weather_pair_limit,
+                report_dir=Path(args.report_dir),
+            )
+        except CorpusWriterLockError as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "writer_lock_rejected",
+                        "operational_corpus_ready": False,
+                        "error": str(exc),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 3
+        except CorpusSnapshotError as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "active_snapshot_invalid",
+                        "operational_corpus_ready": False,
+                        "error": str(exc),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 4
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if bool(result.get("operational_corpus_ready")) else 2
     if args.command == "decision-artifact":
         result = build_decision_artifact(
             paths,
@@ -313,6 +376,27 @@ def initialize(paths: PipelinePaths) -> None:
         _ensure_weather_schema(conn)
     with _connect(paths.decision_db) as conn:
         _ensure_decision_schema(conn)
+
+
+def initialize_weather_corpus(paths: PipelinePaths) -> None:
+    """Initialize only the stores owned by the market/weather corpus writer.
+
+    The live corpus extension must never create or migrate replay quote or
+    decision stores as a side effect.  Keeping this initializer separate from
+    :func:`initialize` makes that boundary explicit and regression-testable.
+    """
+
+    for path in (
+        paths.open_meteo_raw,
+        paths.backtest_data,
+        paths.logs,
+        paths.reports,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    with _connect(paths.market_db) as conn:
+        _ensure_market_schema(conn)
+    with _connect(paths.weather_db) as conn:
+        _ensure_weather_schema(conn)
 
 
 def build_market_universe(
@@ -3192,7 +3276,7 @@ def _status_retryable(status: str) -> int:
 
 
 def _load_city_date_pairs(paths: PipelinePaths, *, start: date, end: date, limit: int) -> list[dict[str, Any]]:
-    with _connect(paths.market_db) as conn:
+    with closing(_connect(paths.market_db)) as conn:
         conn.row_factory = sqlite3.Row
         query = """
             SELECT normalized_city, country_region, latitude, longitude, timezone, market_date_local AS local_date

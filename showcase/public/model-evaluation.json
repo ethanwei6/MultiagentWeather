@@ -1,0 +1,243 @@
+{
+  "schema": "dailyweather.public.model-evaluation.v1",
+  "historicalAggregates": true,
+  "modelFamily": "observed_high_guarded_shrinkage",
+  "evaluationType": "Historical model-family validation on weather labels and resolved market payouts.",
+  "verdict": "research_only_fails_city_region_holdouts",
+  "outerTestMonths": [
+    "2026-01",
+    "2026-02",
+    "2026-03",
+    "2026-04",
+    "2026-05",
+    "2026-06"
+  ],
+  "method": {
+    "selection": "Within each family and outer target month, configuration selected using an earlier inner validation month; selected configurations differ by month. Aggregate primary metrics use zero-embargo outer tests only.",
+    "embargoDays": [
+      0,
+      3,
+      7
+    ],
+    "candidateConfigurations": 24,
+    "primaryEmbargoDays": 0
+  },
+  "weatherEvaluation": {
+    "target": "Bucket membership of realized weather high (weather-derived binary label)",
+    "rows": 315793,
+    "rowDefinition": "Forecast/bucket/decision-time validation rows, not independent trades or unique weather events.",
+    "cityDateClusters": 2718,
+    "baseline": {
+      "brier": 0.05103728,
+      "logLoss": 0.17116394
+    },
+    "candidate": {
+      "brier": 0.04111314,
+      "logLoss": 0.14121887
+    },
+    "improvement": {
+      "brier": 0.00992414,
+      "logLoss": 0.02994507
+    },
+    "cityDateClusterBootstrap": {
+      "confidenceLevel": 0.95,
+      "iterations": 200,
+      "clusters": 2718,
+      "brierImprovementInterval": [
+        0.00927117,
+        0.01090917
+      ],
+      "logLossImprovementInterval": [
+        0.02790032,
+        0.03259431
+      ]
+    }
+  },
+  "marketDiagnostic": {
+    "target": "Resolved Polymarket payout of the quoted YES or NO side",
+    "rows": 372380,
+    "rowDefinition": "Matched market/decision-time/side rows; related YES/NO sides and repeated times are not independent events.",
+    "weatherVsSettlementMismatchRate": 0.14309,
+    "mismatchRateDenominator": 372380,
+    "verdict": "Market midpoint outperformed the candidate on both Brier score and log loss.",
+    "explanation": "Weather-derived labels and resolved market payouts are different targets; do not compare the weather panel numbers directly with market panel numbers.",
+    "baseline": {
+      "n": 372380,
+      "brier": 0.08447963,
+      "log_loss": 0.28503256
+    },
+    "candidate": {
+      "n": 372380,
+      "brier": 0.09315534,
+      "log_loss": 0.33745486
+    },
+    "marketMidpoint": {
+      "n": 372380,
+      "brier": 0.07418127,
+      "log_loss": 0.24138138
+    }
+  },
+  "gates": {
+    "cityHoldout": {
+      "passed": 13,
+      "total": 22,
+      "passRate": 0.5909090909090909,
+      "requiredRate": 0.7,
+      "status": "FAIL",
+      "passDefinition": "Improves both Brier score and log loss versus baseline on a held-out city."
+    },
+    "regionHoldout": {
+      "passed": 2,
+      "total": 3,
+      "passRate": 0.6666666666666666,
+      "requiredRate": 0.7,
+      "status": "FAIL",
+      "passDefinition": "Improves both Brier score and log loss versus baseline on a held-out region."
+    },
+    "aggregateWeather": true,
+    "parameterPlateau": true,
+    "liveFeatures": true,
+    "marketComparison": false
+  },
+  "outerSplits": [
+    {
+      "target_month": "2026-01",
+      "embargo_days": 0,
+      "train_n": 18741,
+      "inner_valid_n": 10852,
+      "test_n": 13619
+    },
+    {
+      "target_month": "2026-02",
+      "embargo_days": 0,
+      "train_n": 32052,
+      "inner_valid_n": 12541,
+      "test_n": 19053
+    },
+    {
+      "target_month": "2026-03",
+      "embargo_days": 0,
+      "train_n": 50581,
+      "inner_valid_n": 17451,
+      "test_n": 44124
+    },
+    {
+      "target_month": "2026-04",
+      "embargo_days": 0,
+      "train_n": 93634,
+      "inner_valid_n": 41451,
+      "test_n": 78496
+    },
+    {
+      "target_month": "2026-05",
+      "embargo_days": 0,
+      "train_n": 169457,
+      "inner_valid_n": 73150,
+      "test_n": 85338
+    },
+    {
+      "target_month": "2026-06",
+      "embargo_days": 0,
+      "train_n": 254795,
+      "inner_valid_n": 79992,
+      "test_n": 75163
+    },
+    {
+      "target_month": "2026-01",
+      "embargo_days": 3,
+      "train_n": 17586,
+      "inner_valid_n": 9697,
+      "test_n": 13619
+    },
+    {
+      "target_month": "2026-02",
+      "embargo_days": 3,
+      "train_n": 30435,
+      "inner_valid_n": 10924,
+      "test_n": 19053
+    },
+    {
+      "target_month": "2026-03",
+      "embargo_days": 3,
+      "train_n": 48178,
+      "inner_valid_n": 15048,
+      "test_n": 44124
+    },
+    {
+      "target_month": "2026-04",
+      "embargo_days": 3,
+      "train_n": 86374,
+      "inner_valid_n": 34191,
+      "test_n": 78496
+    },
+    {
+      "target_month": "2026-05",
+      "embargo_days": 3,
+      "train_n": 161438,
+      "inner_valid_n": 65131,
+      "test_n": 85338
+    },
+    {
+      "target_month": "2026-06",
+      "embargo_days": 3,
+      "train_n": 246776,
+      "inner_valid_n": 71973,
+      "test_n": 75163
+    },
+    {
+      "target_month": "2026-01",
+      "embargo_days": 7,
+      "train_n": 16046,
+      "inner_valid_n": 8157,
+      "test_n": 13619
+    },
+    {
+      "target_month": "2026-02",
+      "embargo_days": 7,
+      "train_n": 28279,
+      "inner_valid_n": 8768,
+      "test_n": 19053
+    },
+    {
+      "target_month": "2026-03",
+      "embargo_days": 7,
+      "train_n": 44974,
+      "inner_valid_n": 11844,
+      "test_n": 44124
+    },
+    {
+      "target_month": "2026-04",
+      "embargo_days": 7,
+      "train_n": 77277,
+      "inner_valid_n": 25094,
+      "test_n": 78496
+    },
+    {
+      "target_month": "2026-05",
+      "embargo_days": 7,
+      "train_n": 150746,
+      "inner_valid_n": 54439,
+      "test_n": 85338
+    },
+    {
+      "target_month": "2026-06",
+      "embargo_days": 7,
+      "train_n": 236084,
+      "inner_valid_n": 61281,
+      "test_n": 75163
+    }
+  ],
+  "limitations": [
+    "Aggregate scores describe a historical research evaluation. The public dashboard generates its execution examples separately from fictional inputs.",
+    "Configurations were selected on an earlier inner month within each family and outer month. Primary scores use the six zero-embargo outer tests from January through June 2026.",
+    "Weather-derived labels and market settlement labels use different populations. Compare scores within each target.",
+    "Several rows share a city-date event, decision time, or complementary market side. Row totals include correlated observations.",
+    "The reported 95% weather improvement interval uses 200 city-date cluster bootstrap resamples across 2,718 clusters.",
+    "The candidate missed city and region holdout requirements. The market midpoint obtained lower Brier score and log loss on the payout target.",
+    "Same-day rows can use a point-in-time observed high. The wider weather evaluation includes more forecast horizons than the one- and two-day signal screens."
+  ],
+  "publicMethodSource": {
+    "repository": "https://github.com/ethanwei6/MultiagentWeather",
+    "file": "daily_weather_pipeline/weather_model_improvement.py"
+  }
+}
